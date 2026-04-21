@@ -1,6 +1,14 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf';
-pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.9.179/pdf.worker.min.js';
+import pdfWorkerSrc from 'pdfjs-dist/legacy/build/pdf.worker.min.js?url';
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
+
+const OPENAI_BASE = import.meta.env.VITE_OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+const OPENAI_KEY  = import.meta.env.VITE_OPENAI_API_KEY  ?? "";
+const OPENAI_HEADERS = {
+  "Content-Type": "application/json",
+  "Authorization": `Bearer ${OPENAI_KEY}`,
+};
 import {
   Users, FileText, Settings, ChevronLeft, Mail, Lock,
   GraduationCap, Plus, Calendar, CheckCircle2, TrendingUp,
@@ -73,79 +81,89 @@ function Dash({onSelect}){return(<div style={_ctr}><div style={{display:"flex",j
    PDF VIEWER — uses browser's native PDF renderer + overlay boxes
    No external libraries needed. Uses <object> with blob URL.
    ═══════════════════════════════════════════════════════════ */
-function PdfViewer({file, boxes, activeBox, onSelectBox, onUpdateBox, tool, pageNum, onPageChange, totalPages, pdfInteractive=true}){
+function PdfViewer({file, boxes, activeBox, onSelectBox, onUpdateBox, tool, pageNum, onPageChange, totalPages, onLoad}){
   const containerRef = useRef(null);
-  const overlayRef = useRef(null);
-  const drawRef = useRef(null);
-  const [blobUrl, setBlobUrl] = useState(null);
+  const canvasRef   = useRef(null);
+  const overlayRef  = useRef(null);
+  const drawRef     = useRef(null);
+  const pdfDocRef   = useRef(null);
+  const renderTaskRef = useRef(null);
   const [drawing, setDrawing] = useState(null);
-  const [overlaySize, setOverlaySize] = useState({ w: 0, h: 0 });
-  const containerH = 600;
+  const containerH = 620;
 
-  // Create blob URL from file
+  // Render one page onto the canvas, scaled to fill the container width exactly
+  const renderPage = useCallback(async (doc, num) => {
+    if (!canvasRef.current || !doc) return;
+    if (renderTaskRef.current) { try { renderTaskRef.current.cancel(); } catch(_){} }
+    try {
+      const page      = await doc.getPage(Math.min(num, doc.numPages));
+      const baseVp    = page.getViewport({ scale: 1 });
+      const containerW = containerRef.current ? containerRef.current.clientWidth : 800;
+      const scale     = containerW / baseVp.width;
+      const vp        = page.getViewport({ scale: Math.max(0.5, scale) });
+      const canvas    = canvasRef.current;
+      canvas.width    = vp.width;
+      canvas.height   = vp.height;
+      renderTaskRef.current = page.render({ canvasContext: canvas.getContext("2d"), viewport: vp });
+      await renderTaskRef.current.promise;
+    } catch(e) { if (e?.name !== "RenderingCancelledException") console.error("PDF render:", e); }
+  }, []);
+
+  // Load document when file changes
   useEffect(() => {
-    if (!file) { setBlobUrl(null); return; }
-    const url = URL.createObjectURL(file);
-    setBlobUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
+    if (!file) { pdfDocRef.current = null; return; }
+    (async () => {
+      try {
+        const ab  = await file.arrayBuffer();
+        const doc = await pdfjsLib.getDocument({ data: ab }).promise;
+        pdfDocRef.current = doc;
+        if (onLoad) onLoad(doc.numPages);
+        renderPage(doc, pageNum);
+      } catch(e) { console.error("PDF load:", e); }
+    })();
+  }, [file]); // eslint-disable-line
 
-  // Track overlay actual dimensions
+  // Re-render when page number changes
   useEffect(() => {
-    if (!overlayRef.current) return;
-    const updateSize = () => {
-      const rect = overlayRef.current.getBoundingClientRect();
-      setOverlaySize({ w: rect.width, h: rect.height });
-    };
-    updateSize();
-    const timer = setTimeout(updateSize, 100);
-    window.addEventListener("resize", updateSize);
-    return () => {
-      clearTimeout(timer);
-      window.removeEventListener("resize", updateSize);
-    };
-  }, [blobUrl, pageNum]);
+    if (pdfDocRef.current) renderPage(pdfDocRef.current, pageNum);
+  }, [pageNum, renderPage]);
 
-  // Drawing handlers with corrected coordinate system
+  // --- Drawing handlers ---
+  // getBoundingClientRect() already accounts for container scroll offset,
+  // so (clientY - rect.top) gives the canvas-absolute y coordinate directly.
   const startDraw = (e) => {
     if (tool !== "draw" || !overlayRef.current) return;
     const r = overlayRef.current.getBoundingClientRect();
-    const x = Math.max(0, Math.min(r.width, e.clientX - r.left));
-    const y = Math.max(0, Math.min(r.height, e.clientY - r.top));
-    setDrawing({ x, y, w: 0, h: 0 });
+    setDrawing({ x: e.clientX - r.left, y: e.clientY - r.top, w: 0, h: 0 });
   };
   const moveDraw = (e) => {
     if (!drawing || !overlayRef.current) return;
     const r = overlayRef.current.getBoundingClientRect();
-    const currentX = Math.max(0, Math.min(r.width, e.clientX - r.left));
-    const currentY = Math.max(0, Math.min(r.height, e.clientY - r.top));
-    setDrawing(d => ({ ...d, w: currentX - d.x, h: currentY - d.y }));
+    setDrawing(d => ({ ...d, w: e.clientX - r.left - d.x, h: e.clientY - r.top - d.y }));
   };
   const endDraw = () => {
-    if (!drawing || !overlayRef.current) setDrawing(null);
     if (!drawing) return;
-    const r = overlayRef.current.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) { setDrawing(null); return; }
-    
-    // Normalize the drawing coordinates
-    const minW = Math.abs(drawing.w);
-    const minH = Math.abs(drawing.h);
-    if (minW < 20 || minH < 20) { setDrawing(null); return; }
-    
-    // Calculate normalized box coordinates
-    const startX = drawing.w < 0 ? drawing.x + drawing.w : drawing.x;
-    const startY = drawing.h < 0 ? drawing.y + drawing.h : drawing.y;
-    const boxW = Math.abs(drawing.w);
-    const boxH = Math.abs(drawing.h);
-    
-    // Convert to percentages
-    const x = (startX / r.width) * 100;
-    const y = (startY / r.height) * 100;
-    const w = (boxW / r.width) * 100;
-    const h = (boxH / r.height) * 100;
-    
-    if (onUpdateBox) onUpdateBox("add", { x, y, w, h, page: pageNum });
+    const r = overlayRef.current?.getBoundingClientRect();
+    if (!r || r.width === 0 || r.height === 0) { setDrawing(null); return; }
+    const aw = Math.abs(drawing.w), ah = Math.abs(drawing.h);
+    if (aw < 20 || ah < 20) { setDrawing(null); return; }
+    const sx = drawing.w < 0 ? drawing.x + drawing.w : drawing.x;
+    const sy = drawing.h < 0 ? drawing.y + drawing.h : drawing.y;
+    if (onUpdateBox) onUpdateBox("add", {
+      x: (sx / r.width)  * 100,
+      y: (sy / r.height) * 100,
+      w: (aw / r.width)  * 100,
+      h: (ah / r.height) * 100,
+      page: pageNum,
+    });
     setDrawing(null);
+  };
+
+  // Forward wheel events from the draw layer to the scroll container
+  // so the user can scroll the PDF even while the draw tool is active.
+  const forwardWheel = (e) => {
+    e.stopPropagation();
+    if (containerRef.current) containerRef.current.scrollTop += e.deltaY;
   };
 
   const pageBoxes = (boxes || []).filter(b => b.page === pageNum);
@@ -162,80 +180,1154 @@ function PdfViewer({file, boxes, activeBox, onSelectBox, onUpdateBox, tool, page
         </div>
         <div style={{ fontSize: 11, color: T.textSec }}>{pageBoxes.length} boxes on this page</div>
       </div>
-      {/* PDF + Overlay */}
-      <div ref={containerRef} style={{ position: "relative", height: containerH, borderRadius: T.rs, border: `1px solid ${T.border}`, overflow: "auto", background: "#525659" }}>
-        {/* Native PDF embed — uses browser's built-in renderer */}
-        {blobUrl ? (
-          <object
-            data={`${blobUrl}#page=${pageNum}&toolbar=0&navpanes=0&scrollbar=0`}
-            type="application/pdf"
-            style={{ width: "100%", height: "100%", border: "none", pointerEvents: pdfInteractive?"auto":"none" }}
-          >
-            <embed src={`${blobUrl}#page=${pageNum}`} type="application/pdf" style={{ width: "100%", height: "100%", pointerEvents: pdfInteractive?"auto":"none" }} />
-          </object>
+      {/* Scrollable container — canvas may be taller than containerH */}
+      <div ref={containerRef} style={{ height: containerH, borderRadius: T.rs, border: `1px solid ${T.border}`, overflow: "auto", background: "#525659" }}>
+        {file ? (
+          <div style={{ position: "relative" }}>
+            {/* PDF.js renders here — width matches container, height proportional */}
+            <canvas ref={canvasRef} style={{ display: "block" }} />
+            {/* Overlay — covers the canvas exactly */}
+            <div ref={overlayRef} style={{ position: "absolute", inset: 0, zIndex: 10, pointerEvents: "none" }}>
+              {/* Saved bounding boxes */}
+              <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+                {pageBoxes.map(b => {
+                  const isActive = activeBox === b.id;
+                  const color = b.type === "question" ? T.primary : T.green;
+                  return (
+                    <div key={b.id} onClick={(e) => { e.stopPropagation(); onSelectBox && onSelectBox(b.id); }}
+                      style={{
+                        position: "absolute", left: `${b.x}%`, top: `${b.y}%`, width: `${b.w}%`, height: `${b.h}%`,
+                        border: `2.5px solid ${isActive ? color : color + "90"}`, borderRadius: 6,
+                        background: `${color}${isActive ? "18" : "08"}`, cursor: "pointer",
+                        boxShadow: isActive ? `0 0 0 3px ${color}30` : "none", transition: "all 0.2s",
+                        pointerEvents: "auto",
+                      }}>
+                      <div style={{ position: "absolute", top: -12, left: 6, background: T.card, padding: "1px 8px", fontSize: 10, fontWeight: 800, color, borderRadius: 3, boxShadow: "0 1px 3px rgba(0,0,0,0.15)" }}>
+                        {b.label}
+                      </div>
+                      {isActive && (
+                        <div style={{ position: "absolute", bottom: -12, right: 6, background: T.card, padding: "1px 8px", fontSize: 10, fontWeight: 700, color: T.textSec, borderRadius: 3, boxShadow: "0 1px 3px rgba(0,0,0,0.15)" }}>
+                          {b.pts} pts · {b.qtype}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {/* Draw capture layer */}
+              <div
+                ref={drawRef}
+                style={{ position: "absolute", inset: 0, cursor: tool === "draw" ? "crosshair" : "default", pointerEvents: tool === "draw" ? "auto" : "none" }}
+                onMouseDown={startDraw}
+                onMouseMove={moveDraw}
+                onMouseUp={endDraw}
+                onMouseLeave={() => drawing && endDraw()}
+                onWheel={forwardWheel}
+              >
+                {drawing && (
+                  <div style={{
+                    position: "absolute",
+                    left:   drawing.w < 0 ? drawing.x + drawing.w : drawing.x,
+                    top:    drawing.h < 0 ? drawing.y + drawing.h : drawing.y,
+                    width:  Math.abs(drawing.w),
+                    height: Math.abs(drawing.h),
+                    border: `2px dashed ${T.green}`,
+                    borderRadius: 4,
+                    background: `${T.green}15`,
+                    pointerEvents: "none",
+                  }} />
+                )}
+              </div>
+            </div>
+          </div>
         ) : (
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", flexDirection: "column", gap: 8 }}>
             <FileText size={32} color="#999" />
             <p style={{ color: "#999", fontSize: 14 }}>Upload a PDF to preview</p>
           </div>
         )}
-        {/* Bounding box overlay — separate layers so PDF can receive scroll/pan events */}
-        {blobUrl && (
-          <div ref={overlayRef} style={{ position: "absolute", inset: 0, zIndex: 10, pointerEvents: "none" }}>
-            {/* Boxes layer: only boxes capture pointer events; empty overlay passes through */}
-            <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
-              {pageBoxes.map(b => {
-                const isActive = activeBox === b.id;
-                const color = b.type === "question" ? T.primary : T.green;
-                return (
-                  <div key={b.id} onClick={(e) => { e.stopPropagation(); onSelectBox && onSelectBox(b.id); }}
-                    style={{
-                      position: "absolute", left: `${b.x}%`, top: `${b.y}%`, width: `${b.w}%`, height: `${b.h}%`,
-                      border: `2.5px solid ${isActive ? color : color + "90"}`, borderRadius: 6,
-                      background: `${color}${isActive ? "18" : "08"}`, cursor: "pointer",
-                      boxShadow: isActive ? `0 0 0 3px ${color}30` : "none", transition: "all 0.2s",
-                      pointerEvents: "auto",
-                    }}>
-                    <div style={{ position: "absolute", top: -12, left: 6, background: T.card, padding: "1px 8px", fontSize: 10, fontWeight: 800, color, borderRadius: 3, boxShadow: "0 1px 3px rgba(0,0,0,0.15)" }}>
-                      {b.label}
-                    </div>
-                    {isActive && (
-                      <div style={{ position: "absolute", bottom: -12, right: 6, background: T.card, padding: "1px 8px", fontSize: 10, fontWeight: 700, color: T.textSec, borderRadius: 3, boxShadow: "0 1px 3px rgba(0,0,0,0.15)" }}>
-                        {b.pts} pts · {b.qtype}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            {/* Drawing layer: only intercept pointer events when in draw mode */}
-            <div
-              ref={drawRef}
-              style={{ position: "absolute", inset: 0, cursor: tool === "draw" ? "crosshair" : "default", pointerEvents: tool === "draw" ? "auto" : "none" }}
-              onMouseDown={startDraw}
-              onMouseMove={moveDraw}
-              onMouseUp={endDraw}
-              onMouseLeave={() => drawing && endDraw()}
-            >
-              {/* Drawing preview */}
-              {drawing && (
-                <div style={{
-                  position: "absolute",
-                  left: drawing.w < 0 ? drawing.x + drawing.w : drawing.x,
-                  top: drawing.h < 0 ? drawing.y + drawing.h : drawing.y,
-                  width: Math.abs(drawing.w),
-                  height: Math.abs(drawing.h),
-                  border: `2px dashed ${T.green}`,
-                  borderRadius: 4,
-                  background: `${T.green}15`,
-                }} />
-              )}
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
+}
+
+/* ═══ Box Label Dialog ═══ */
+function BoxDialog({ box, questions, onConfirm, onCancel }) {
+  const [type, setType] = useState("answer");
+  const [label, setLabel] = useState("");
+  const [pts, setPts] = useState("");
+  const [linkedQId, setLinkedQId] = useState("");
+
+  const handleConfirm = () => {
+    const parsedPts = parseInt(pts) || 0;
+    const linkedQ = questions.find(q => q.id === Number(linkedQId));
+    const defaultLabel = type === "question"
+      ? `Q (p.${box.page})`
+      : linkedQ ? `A${linkedQ.num}` : `Region`;
+    onConfirm({
+      type,
+      label: label.trim() || defaultLabel,
+      pts: type === "question" ? parsedPts : (linkedQ ? linkedQ.pts : 0),
+      qtype: type === "question" ? "manual" : (linkedQ ? linkedQ.type : "manual"),
+      linkedQId: type === "answer" && linkedQId ? Number(linkedQId) : null,
+    });
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ background: T.card, borderRadius: T.r, border: `1px solid ${T.border}`, padding: 28, width: 380, boxShadow: T.shLg }}>
+        <h3 style={{ margin: "0 0 4px", fontSize: 16, fontWeight: 800 }}>Label this region</h3>
+        <p style={{ margin: "0 0 20px", fontSize: 12, color: T.textSec }}>
+          Page {box.page} · x:{box.x.toFixed(1)}% y:{box.y.toFixed(1)}% · {box.w.toFixed(1)}×{box.h.toFixed(1)}%
+        </p>
+
+        {/* Type toggle */}
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: "block", fontWeight: 700, fontSize: 11, marginBottom: 6, color: T.textSec, textTransform: "uppercase" }}>Type</label>
+          <div style={{ display: "flex", gap: 6 }}>
+            {["question", "answer"].map(t => (
+              <button key={t} onClick={() => setType(t)} style={{
+                flex: 1, padding: "9px 0", borderRadius: T.rs, fontWeight: 700, fontSize: 13,
+                border: `2px solid ${type === t ? (t === "question" ? T.primary : T.green) : T.border}`,
+                background: type === t ? (t === "question" ? T.primaryLight : T.greenLight) : "transparent",
+                color: type === t ? (t === "question" ? T.primary : T.green) : T.textSec,
+                cursor: "pointer", fontFamily: T.font,
+              }}>
+                {t === "question" ? "Question" : "Answer Region"}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Label */}
+        <div style={{ marginBottom: 14 }}>
+          <label style={{ display: "block", fontWeight: 700, fontSize: 11, marginBottom: 5, color: T.textSec, textTransform: "uppercase" }}>Label</label>
+          <input
+            value={label}
+            onChange={e => setLabel(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") handleConfirm(); if (e.key === "Escape") onCancel(); }}
+            placeholder={type === "question" ? "e.g. Q1 — Linear Regression" : "e.g. Student answer area"}
+            style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${T.border}`, borderRadius: T.rs, fontSize: 13, outline: "none", fontFamily: T.font, boxSizing: "border-box" }}
+            autoFocus
+          />
+        </div>
+
+        {/* Points (question only) */}
+        {type === "question" && (
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontWeight: 700, fontSize: 11, marginBottom: 5, color: T.textSec, textTransform: "uppercase" }}>Points</label>
+            <input
+              value={pts}
+              onChange={e => setPts(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") handleConfirm(); }}
+              type="number" min="0" placeholder="e.g. 10"
+              style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${T.border}`, borderRadius: T.rs, fontSize: 13, outline: "none", fontFamily: T.font, boxSizing: "border-box" }}
+            />
+          </div>
+        )}
+
+        {/* Link to detected question (answer only) */}
+        {type === "answer" && questions.length > 0 && (
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontWeight: 700, fontSize: 11, marginBottom: 5, color: T.textSec, textTransform: "uppercase" }}>Link to Question (optional)</label>
+            <select
+              value={linkedQId}
+              onChange={e => setLinkedQId(e.target.value)}
+              style={{ width: "100%", padding: "10px 12px", border: `1.5px solid ${T.border}`, borderRadius: T.rs, fontSize: 13, outline: "none", fontFamily: T.font, background: T.card, cursor: "pointer", boxSizing: "border-box" }}
+            >
+              <option value="">— unlinked —</option>
+              {questions.map(q => (
+                <option key={q.id} value={q.id}>Q{q.num}: {q.title} ({q.pts}pts)</option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {/* Buttons */}
+        <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
+          <button onClick={onCancel} style={{ ..._b("outline"), flex: 1, justifyContent: "center" }}>Cancel</button>
+          <button onClick={handleConfirm} style={{ ..._b(type === "question" ? "blue" : "green"), flex: 1, justifyContent: "center" }}>
+            <Check size={14} /> Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   EXAM INSIGHTS — aggregate stats computed from AI grading results
+   ═══════════════════════════════════════════════════════════ */
+function computeExamStats(results, questions){
+  const n=results.length; if(!n) return null;
+  const pcts=results.map(r=>r.maxScore>0?(r.totalScore/r.maxScore)*100:0);
+  const sorted=[...pcts].sort((a,b)=>a-b);
+  const avg=pcts.reduce((s,x)=>s+x,0)/n;
+  const median=n%2===0?(sorted[n/2-1]+sorted[n/2])/2:sorted[Math.floor(n/2)];
+  const std=Math.sqrt(pcts.reduce((s,x)=>s+(x-avg)**2,0)/n);
+  const q1=sorted[Math.floor(n*0.25)]||sorted[0];
+  const q3=sorted[Math.floor(n*0.75)]||sorted[n-1];
+  const buckets=[0,0,0,0,0];
+  pcts.forEach(p=>{const i=Math.min(4,Math.floor(p/20));buckets[i]++;});
+
+  const perQ=questions.map(q=>{
+    const grades=results.map(r=>r.grades.find(g=>g.qId===q.id)).filter(Boolean);
+    const tot=grades.length||1;
+    const avgPts=grades.reduce((s,g)=>s+g.total,0)/tot;
+    const avgPct=q.pts>0?(avgPts/q.pts)*100:0;
+    const fullCredit=grades.filter(g=>g.total===q.pts).length/tot*100;
+    const errorRate=grades.filter(g=>g.total<q.pts).length/tot*100;
+    const diff=avgPct>=75?{l:"Low",c:"green"}:avgPct>=60?{l:"Medium",c:"orange"}:{l:"High",c:"red"};
+    const critFail={};
+    grades.forEach(g=>(g.criteria||[]).forEach(c=>{if(c.earned<c.maxPts){critFail[c.title]=(critFail[c.title]||0)+1;}}));
+    const topMistakes=Object.entries(critFail).sort((a,b)=>b[1]-a[1]).slice(0,2).map(([title,count])=>({title,count,pct:Math.round(count/tot*100)}));
+    return {q,avgPts,avgPct,fullCredit,errorRate,diff,topMistakes,grades,tot};
+  });
+
+  const sortedByAvg=[...perQ].sort((a,b)=>a.avgPct-b.avgPct);
+  const hardest=sortedByAvg[0];
+  const easiest=sortedByAvg[sortedByAvg.length-1];
+
+  const allMistakes={};
+  perQ.forEach(pq=>pq.topMistakes.forEach(m=>{
+    const key=`${m.title}__${pq.q.num}`;
+    allMistakes[key]={title:m.title,qNum:pq.q.num,count:m.count,pct:m.pct};
+  }));
+  const topGlobal=Object.values(allMistakes).sort((a,b)=>b.count-a.count).slice(0,4);
+
+  return {n,avg,median,std,q1,q3,buckets,perQ,hardest,easiest,topGlobal};
+}
+
+function ExamInsights({gradingResults,questions}){
+  const stats=computeExamStats(gradingResults,questions);
+  if(!stats)return null;
+  const {n,avg,median,std,q1,q3,buckets,perQ,hardest,easiest,topGlobal}=stats;
+  const examTotal=questions.reduce((s,q)=>s+q.pts,0);
+
+  // Small reusable card styles
+  const statCard={background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"20px 22px"};
+  const insightCard=(color)=>({background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,borderLeft:`4px solid ${color}`,padding:"20px 22px",breakInside:"avoid",display:"inline-block",width:"100%",boxSizing:"border-box",marginBottom:14});
+  const sectionTitle={fontSize:16,fontWeight:800,margin:"28px 0 14px",display:"flex",alignItems:"center",gap:8};
+  const analysisTxt=(pct,errorPct,mistakes)=>{
+    if(pct>=80)return "Strong overall performance. Students demonstrated solid grasp of the concepts.";
+    if(pct>=65){const top=mistakes[0];return top?`Moderate performance. Most common issue: ${top.title.toLowerCase()} (${top.pct}% of students).`:"Moderate performance overall.";}
+    const top=mistakes[0];
+    return top?`Significant difficulty detected. Primary issue: ${top.title.toLowerCase()} (${top.pct}% of students). Consider reteaching.`:"Significant difficulty detected. Consider reviewing this topic.";
+  };
+
+  // Visual Analytics SVG dimensions
+  const chartW=420,chartH=220,padL=42,padR=12,padT=14,padB=36;
+  const plotW=chartW-padL-padR,plotH=chartH-padT-padB;
+  const maxCount=Math.max(...buckets,1);
+  const barGap=8,barW=(plotW-barGap*4)/5;
+  const bucketLabels=["0-20%","20-40%","40-60%","60-80%","80-100%"];
+  const errMax=Math.max(...perQ.map(p=>p.errorRate),1);
+  const errBarW=(plotW-barGap*(perQ.length-1))/perQ.length;
+
+  // Y-axis tick generator
+  const ticks=(max,count=4)=>{const step=Math.ceil(max/count/5)*5||1;const out=[];for(let v=0;v<=step*count;v+=step)if(v<=max*1.1)out.push(v);return out;};
+  const distTicks=ticks(maxCount);
+  const errTicks=ticks(errMax);
+  const earnedPct=Math.max(0,Math.min(100,avg));
+  const lostPct=100-earnedPct;
+  const scorePcts=gradingResults.map(r=>r.maxScore>0?(r.totalScore/r.maxScore)*100:0);
+  const masteryCount=scorePcts.filter(p=>p>=85).length;
+  const onTrackCount=scorePcts.filter(p=>p>=70&&p<85).length;
+  const supportCount=scorePcts.filter(p=>p<70).length;
+  const riskQs=[...perQ].filter(p=>p.avgPct<75||p.errorRate>35).sort((a,b)=>b.errorRate-a.errorRate).slice(0,4);
+  const quickWins=[...perQ].filter(p=>p.avgPct>=65&&p.avgPct<85&&p.errorRate<=45).sort((a,b)=>b.fullCredit-a.fullCredit).slice(0,3);
+  const spreadLabel=std<10?"tight and consistent":std<18?"moderately varied":"widely spread";
+  const performanceLabel=avg>=82?"strong class mastery":avg>=70?"solid progress with targeted gaps":avg>=60?"mixed understanding that needs review":"high-risk performance pattern";
+  const nextActions=[
+    hardest?`Open with Q${hardest.q.num}: review the main misconception, then show one worked example and one near-transfer problem.`:"Start with a short whole-class review of the lowest scoring objective.",
+    riskQs.length?`Run a 10-minute checkpoint on ${riskQs.slice(0,2).map(p=>`Q${p.q.num}`).join(" and ")} before moving to new material.`:"Use a short retrieval warm-up to confirm students can reproduce the strongest topics independently.",
+    topGlobal[0]?`Add feedback language for "${topGlobal[0].title}" so future grading comments stay consistent.`:"Ask students to explain their reasoning in one sentence to surface hidden misconceptions."
+  ];
+
+  return(<div>
+    {/* ── Summary stat cards ── */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14,marginBottom:4}}>
+      <div style={statCard}>
+        <div style={{fontSize:12,fontWeight:600,color:T.textSec,marginBottom:8}}>Average Score</div>
+        <div style={{fontSize:32,fontWeight:900,lineHeight:1}}>{avg.toFixed(1)}%</div>
+        <div style={{fontSize:12,color:T.textSec,marginTop:6}}>{n} of {n} graded</div>
+      </div>
+      <div style={statCard}>
+        <div style={{fontSize:12,fontWeight:600,color:T.textSec,marginBottom:8}}>Median Score</div>
+        <div style={{fontSize:32,fontWeight:900,lineHeight:1}}>{median.toFixed(0)}%</div>
+        <div style={{fontSize:12,color:T.textSec,marginTop:6}}>Middle 50% range: {q1.toFixed(0)}-{q3.toFixed(0)}%</div>
+      </div>
+      <div style={statCard}>
+        <div style={{fontSize:12,fontWeight:600,color:T.textSec,marginBottom:8}}>Standard Deviation</div>
+        <div style={{fontSize:32,fontWeight:900,lineHeight:1}}>{std.toFixed(1)}</div>
+        <div style={{fontSize:12,color:T.textSec,marginTop:6}}>{std<10?"Low":std<18?"Moderate":"High"} variance in scores</div>
+      </div>
+    </div>
+
+    {/* ── AI Insights ── */}
+    <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"14px 18px",margin:"14px 0 4px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:9}}>
+        <div style={{fontSize:12,fontWeight:800,color:T.text}}>Class Score Progress</div>
+        <div style={{display:"flex",gap:12,fontSize:11,fontWeight:700,color:T.textSec}}>
+          <span style={{color:T.primary}}>Earned {earnedPct.toFixed(0)}%</span>
+          <span>Lost {lostPct.toFixed(0)}%</span>
+        </div>
+      </div>
+      <div style={{height:10,borderRadius:T.rr,background:`linear-gradient(90deg,#F2F3FA 0%,#F7F4FF 100%)`,overflow:"hidden",border:`1px solid ${T.primary}10`}}>
+        <div style={{height:"100%",width:`${earnedPct}%`,background:`linear-gradient(90deg,${T.primary} 0%,${T.purple} 100%)`,borderRadius:T.rr,boxShadow:"0 0 14px rgba(67,85,219,0.24)"}}/>
+      </div>
+    </div>
+
+    <h3 style={sectionTitle}><Sparkles size={16} color={T.purple}/>AI Insights</h3>
+    <div style={{columns:"2 360px",columnGap:14}}>
+      {hardest&&<div style={insightCard(T.red)}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}><AlertCircle size={16} color={T.red}/><span style={{fontWeight:800,fontSize:14}}>Most Challenging Question</span></div>
+          <span style={{background:"#FEE8E8",color:T.red,fontWeight:700,fontSize:11,padding:"3px 10px",borderRadius:T.rr}}>Critical</span>
+        </div>
+        <div style={{fontWeight:800,fontSize:15,marginBottom:4}}>Question {hardest.q.num}</div>
+        <div style={{fontSize:12,color:T.textSec,marginBottom:10}}><span style={{color:T.red,fontWeight:700}}>{hardest.errorRate.toFixed(0)}%</span> of students scored below {(hardest.q.pts*0.6).toFixed(0)}/{hardest.q.pts} points</div>
+        <div style={{background:"#FEF2F2",borderRadius:T.rs,padding:"10px 12px",border:`1px solid ${T.red}20`}}>
+          <div style={{fontSize:11,fontWeight:700,color:T.red,marginBottom:3}}>Common Issue:</div>
+          <p style={{margin:0,fontSize:12,color:T.red,lineHeight:1.5}}>{hardest.topMistakes[0]?`Most students struggled with "${hardest.topMistakes[0].title}". Consider reviewing this topic in next lecture.`:"This question has the lowest average. Review student responses for common misconceptions."}</p>
+        </div>
+      </div>}
+      {easiest&&easiest!==hardest&&<div style={insightCard(T.green)}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}><CheckCircle2 size={16} color={T.green}/><span style={{fontWeight:800,fontSize:14}}>Strong Performance Area</span></div>
+          <span style={{background:T.greenLight,color:T.green,fontWeight:700,fontSize:11,padding:"3px 10px",borderRadius:T.rr}}>Excellent</span>
+        </div>
+        <div style={{fontWeight:800,fontSize:15,marginBottom:4}}>Question {easiest.q.num}</div>
+        <div style={{fontSize:12,color:T.textSec,marginBottom:10}}><span style={{color:T.green,fontWeight:700}}>{easiest.avgPct.toFixed(0)}%</span> average score with consistent performance</div>
+        <div style={{background:T.greenLight,borderRadius:T.rs,padding:"10px 12px",border:`1px solid ${T.green}20`}}>
+          <div style={{fontSize:11,fontWeight:700,color:T.green,marginBottom:3}}>AI Observation:</div>
+          <p style={{margin:0,fontSize:12,color:"#0E6E44",lineHeight:1.5}}>Students demonstrated excellent understanding. Similar complexity questions can be used in future assessments.</p>
+        </div>
+      </div>}
+      <div style={insightCard(T.orange)}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><AlertTriangle size={16} color={T.orange}/><span style={{fontWeight:800,fontSize:14}}>Common Mistakes Detected</span></div>
+        {topGlobal.length?topGlobal.map((m,i)=>(<div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"6px 0"}}>
+          <div style={{width:24,height:24,borderRadius:"50%",background:T.orangeLight,color:T.orange,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:12,flexShrink:0}}>{i+1}</div>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontWeight:700,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.title}</div>
+            <div style={{fontSize:11,color:T.textSec}}>{m.pct}% of students in Q{m.qNum}</div>
+          </div>
+        </div>)):<p style={{margin:0,fontSize:12,color:T.textSec}}>No significant recurring mistakes detected.</p>}
+      </div>
+      <div style={insightCard(T.purple)}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><BookOpen size={16} color={T.purple}/><span style={{fontWeight:800,fontSize:14}}>Identified Learning Gaps</span></div>
+        <div style={{background:T.purpleLight,borderRadius:T.rs,padding:"12px 14px"}}>
+          <div style={{fontSize:13,fontWeight:700,color:T.purple,marginBottom:8}}>Topics to Review</div>
+          <ul style={{margin:0,paddingLeft:18,fontSize:12,color:T.text,lineHeight:1.7}}>
+            {perQ.filter(p=>p.avgPct<70).slice(0,3).map((p,i)=><li key={i}>{p.q.title||`Question ${p.q.num}`}</li>)}
+            {perQ.filter(p=>p.avgPct<70).length===0&&<li>No significant learning gaps — overall strong performance.</li>}
+          </ul>
+        </div>
+      </div>
+      <div style={insightCard(T.primary)}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><TrendingUp size={16} color={T.primary}/><span style={{fontWeight:800,fontSize:14}}>Class Performance Pattern</span></div>
+        <p style={{margin:"0 0 12px",fontSize:12,color:T.textSec,lineHeight:1.55}}>AI reads this as <span style={{fontWeight:800,color:T.primary}}>{performanceLabel}</span> with a <span style={{fontWeight:800,color:T.text}}>{spreadLabel}</span> score distribution.</p>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+          {[{l:"Avg",v:`${avg.toFixed(0)}%`},{l:"Median",v:`${median.toFixed(0)}%`},{l:"Spread",v:std.toFixed(1)}].map(x=><div key={x.l} style={{background:`${T.primary}0A`,border:`1px solid ${T.primary}18`,borderRadius:T.rs,padding:"9px 10px",textAlign:"center"}}>
+            <div style={{fontSize:10,fontWeight:800,color:T.textSec,textTransform:"uppercase"}}>{x.l}</div>
+            <div style={{fontSize:16,fontWeight:900,color:T.text,marginTop:2}}>{x.v}</div>
+          </div>)}
+        </div>
+      </div>
+      <div style={insightCard(T.blue)}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><ClipboardList size={16} color={T.blue}/><span style={{fontWeight:800,fontSize:14}}>Priority Review Sequence</span></div>
+        {riskQs.length?riskQs.map((p,i)=><div key={p.q.id} style={{display:"grid",gridTemplateColumns:"28px 1fr auto",alignItems:"center",gap:10,padding:"7px 0",borderBottom:i<riskQs.length-1?`1px solid ${T.border}`:"none"}}>
+          <div style={{width:24,height:24,borderRadius:"50%",background:`${T.blue}12`,color:T.blue,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:11}}>{i+1}</div>
+          <div style={{minWidth:0}}>
+            <div style={{fontWeight:800,fontSize:12}}>Q{p.q.num}: {p.q.title||"Question focus"}</div>
+            <div style={{fontSize:11,color:T.textSec}}>{p.avgPct.toFixed(0)}% avg · {p.errorRate.toFixed(0)}% error rate</div>
+          </div>
+          <span style={{fontSize:10,fontWeight:800,color:p.errorRate>50?T.red:T.orange,background:p.errorRate>50?"#FEE8E8":T.orangeLight,borderRadius:T.rr,padding:"3px 8px"}}>{p.errorRate>50?"High":"Watch"}</span>
+        </div>):<p style={{margin:0,fontSize:12,color:T.textSec}}>No urgent review sequence needed. Keep reinforcing current mastery.</p>}
+      </div>
+      <div style={insightCard(T.green)}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><Users size={16} color={T.green}/><span style={{fontWeight:800,fontSize:14}}>Student Support Groups</span></div>
+        {[{l:"Mastery",v:masteryCount,c:T.green,b:T.greenLight},{l:"On Track",v:onTrackCount,c:T.primary,b:T.primaryLight},{l:"Needs Review",v:supportCount,c:T.orange,b:T.orangeLight}].map(x=><div key={x.l} style={{display:"flex",alignItems:"center",gap:10,marginBottom:9}}>
+          <div style={{width:88,fontSize:12,fontWeight:800,color:T.text}}>{x.l}</div>
+          <div style={{flex:1,height:8,borderRadius:T.rr,background:"#F1F3F8",overflow:"hidden"}}><div style={{height:"100%",width:`${n?x.v/n*100:0}%`,background:x.c,borderRadius:T.rr}}/></div>
+          <div style={{width:34,textAlign:"right",fontSize:12,fontWeight:900,color:x.c}}>{x.v}</div>
+        </div>)}
+        <p style={{margin:"10px 0 0",fontSize:11,color:T.textSec,lineHeight:1.45}}>{supportCount>0?`${supportCount} student${supportCount===1?"":"s"} should get a targeted correction task before the next assessment.`:"All graded students are at or above the review threshold."}</p>
+      </div>
+      <div style={insightCard(T.purple)}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><Lightbulb size={16} color={T.purple}/><span style={{fontWeight:800,fontSize:14}}>Recommended Next Steps</span></div>
+        {nextActions.map((a,i)=><div key={i} style={{display:"flex",gap:10,padding:"7px 0"}}>
+          <div style={{width:22,height:22,borderRadius:"50%",background:T.purpleLight,color:T.purple,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:11,flexShrink:0}}>{i+1}</div>
+          <div style={{fontSize:12,color:T.textSec,lineHeight:1.5}}>{a}</div>
+        </div>)}
+      </div>
+      <div style={insightCard(T.orange)}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}><Star size={16} color={T.orange}/><span style={{fontWeight:800,fontSize:14}}>Quick Wins</span></div>
+        {quickWins.length?quickWins.map(p=><div key={p.q.id} style={{background:T.orangeLight,borderRadius:T.rs,padding:"9px 11px",marginBottom:8,border:`1px solid ${T.orange}18`}}>
+          <div style={{fontSize:12,fontWeight:900,color:T.text}}>Q{p.q.num}: {p.q.title||"Review item"}</div>
+          <div style={{fontSize:11,color:T.textSec,marginTop:3}}>Good candidate for a short reteach: {p.avgPct.toFixed(0)}% average, {p.fullCredit.toFixed(0)}% full-credit rate.</div>
+        </div>):<p style={{margin:0,fontSize:12,color:T.textSec}}>No mid-range quick wins detected. Focus on either enrichment or deeper remediation.</p>}
+      </div>
+    </div>
+
+    {/* ── Question-Level Breakdown ── */}
+    <h3 style={sectionTitle}><BarChart3 size={16} color={T.primary}/>Question-Level Breakdown</h3>
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      {perQ.map((p,i)=>{
+        const needsAttention=p.avgPct<65;
+        return(<div key={i} style={{background:T.card,borderRadius:T.r,border:needsAttention?`1px solid ${T.red}40`:`1px solid ${T.border}`,padding:"18px 22px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <div style={{fontSize:17,fontWeight:800}}>Question {p.q.num}</div>
+              {needsAttention&&<span style={{background:"#FEE8E8",color:T.red,fontWeight:700,fontSize:10,padding:"3px 9px",borderRadius:T.rr}}>Needs Attention</span>}
+            </div>
+            <div style={{textAlign:"right"}}>
+              <div style={{fontSize:22,fontWeight:900,color:needsAttention?T.red:T.text}}>{p.avgPts.toFixed(1)} / {p.q.pts}</div>
+              <div style={{fontSize:11,fontWeight:600,color:p.diff.c==="green"?T.green:p.diff.c==="orange"?T.orange:T.red,marginTop:2}}>{p.avgPct.toFixed(0)}% avg · {p.diff.l} difficulty</div>
+            </div>
+          </div>
+          <div style={{fontSize:12,color:T.textSec,marginBottom:10}}>{p.q.title||"—"} · {p.q.pts} points</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18,marginBottom:12}}>
+            <div>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:11,fontWeight:600,marginBottom:4}}><span style={{color:T.textSec}}>Error Rate</span><span>{p.errorRate.toFixed(0)}%</span></div>
+              <div style={{height:6,background:T.border,borderRadius:3,overflow:"hidden"}}><div style={{height:"100%",width:`${p.errorRate}%`,background:p.errorRate>40?T.red:p.errorRate>20?T.orange:"#222"}}/></div>
+            </div>
+            <div>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:11,fontWeight:600,marginBottom:4}}><span style={{color:T.textSec}}>Full Credit Rate</span><span>{p.fullCredit.toFixed(0)}%</span></div>
+              <div style={{height:6,background:T.border,borderRadius:3,overflow:"hidden"}}><div style={{height:"100%",width:`${p.fullCredit}%`,background:T.green}}/></div>
+            </div>
+          </div>
+          <div style={{background:`linear-gradient(90deg,${T.purple}0D 0%,${T.primary}08 44%,#FFFFFF 100%)`,borderRadius:T.rs,padding:"10px 14px",display:"flex",gap:8,border:`1px solid ${T.primary}18`,boxShadow:`inset 3px 0 0 ${T.primary}30`}}>
+            <span style={{fontSize:12,fontWeight:700,color:T.text,flexShrink:0}}>AI Analysis:</span>
+            <span style={{fontSize:12,color:T.textSec,lineHeight:1.5}}>{analysisTxt(p.avgPct,p.errorRate,p.topMistakes)}</span>
+          </div>
+        </div>);
+      })}
+    </div>
+
+    {/* ── Visual Analytics ── */}
+    <h3 style={sectionTitle}><TrendingUp size={16} color={T.primary}/>Visual Analytics</h3>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+      {/* Score distribution histogram */}
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"20px 22px"}}>
+        <div style={{fontWeight:800,fontSize:15,marginBottom:2}}>Score Distribution</div>
+        <div style={{fontSize:12,color:T.textSec,marginBottom:14}}>Overall exam performance histogram</div>
+        <svg viewBox={`0 0 ${chartW} ${chartH}`} style={{width:"100%",height:"auto"}}>
+          <defs>
+            <linearGradient id="scoreBarGrad" x1="0" y1="1" x2="0" y2="0">
+              <stop offset="0%" stopColor={T.primary} stopOpacity="0.38"/>
+              <stop offset="68%" stopColor={T.primary} stopOpacity="0.86"/>
+              <stop offset="100%" stopColor={T.purple} stopOpacity="0.96"/>
+            </linearGradient>
+          </defs>
+          {distTicks.map((t,i)=>{const y=padT+plotH-(t/maxCount)*plotH;return(<g key={i}>
+            <line x1={padL} y1={y} x2={chartW-padR} y2={y} stroke={T.border} strokeDasharray="3,3"/>
+            <text x={padL-6} y={y+3} fontSize="10" fill={T.textSec} textAnchor="end">{t}</text>
+          </g>);})}
+          {buckets.map((c,i)=>{const bh=(c/maxCount)*plotH;const bx=padL+i*(barW+barGap);const by=padT+plotH-bh;return(<g key={i}>
+            <rect x={bx} y={by} width={barW} height={bh} fill="url(#scoreBarGrad)" rx="3"/>
+            <text x={bx+barW/2} y={chartH-padB+16} fontSize="10" fill={T.textSec} textAnchor="middle">{bucketLabels[i]}</text>
+          </g>);})}
+          <text x={10} y={padT+plotH/2} fontSize="10" fill={T.textSec} textAnchor="middle" transform={`rotate(-90 10 ${padT+plotH/2})`}>Number of Students</text>
+        </svg>
+        <p style={{margin:"10px 0 0",fontSize:11,color:T.textSec,textAlign:"center",lineHeight:1.4}}>{std<12?"Tight distribution — consistent performance.":std<20?"Normal distribution with moderate spread.":"Wide distribution — significant performance variance."}</p>
+      </div>
+
+      {/* Error rate by question */}
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"20px 22px"}}>
+        <div style={{fontWeight:800,fontSize:15,marginBottom:2}}>Error Rate by Question</div>
+        <div style={{fontSize:12,color:T.textSec,marginBottom:14}}>Percentage of students who lost points</div>
+        <svg viewBox={`0 0 ${chartW} ${chartH}`} style={{width:"100%",height:"auto"}}>
+          <defs>
+            <linearGradient id="errorBarSoftGrad" x1="0" y1="1" x2="0" y2="0">
+              <stop offset="0%" stopColor={T.primary} stopOpacity="0.14"/>
+              <stop offset="72%" stopColor={T.primary} stopOpacity="0.30"/>
+              <stop offset="100%" stopColor={T.purple} stopOpacity="0.38"/>
+            </linearGradient>
+            <linearGradient id="errorBarHighlightGrad" x1="0" y1="1" x2="0" y2="0">
+              <stop offset="0%" stopColor="#F7B267" stopOpacity="0.88"/>
+              <stop offset="100%" stopColor="#D9467C" stopOpacity="0.98"/>
+            </linearGradient>
+          </defs>
+          {errTicks.map((t,i)=>{const y=padT+plotH-(t/errMax)*plotH;return(<g key={i}>
+            <line x1={padL} y1={y} x2={chartW-padR} y2={y} stroke={T.border} strokeDasharray="3,3"/>
+            <text x={padL-6} y={y+3} fontSize="10" fill={T.textSec} textAnchor="end">{t}</text>
+          </g>);})}
+          {perQ.map((p,i)=>{const bh=(p.errorRate/errMax)*plotH;const bx=padL+i*(errBarW+barGap);const by=padT+plotH-bh;const isHighest=hardest&&p.q.id===hardest.q.id;return(<g key={i}>
+            <rect x={bx} y={by} width={errBarW} height={bh} fill={isHighest?"url(#errorBarHighlightGrad)":"url(#errorBarSoftGrad)"} rx="3"/>
+            <text x={bx+errBarW/2} y={chartH-padB+16} fontSize="10" fill={T.textSec} textAnchor="middle">Q{p.q.num}</text>
+          </g>);})}
+          <text x={10} y={padT+plotH/2} fontSize="10" fill={T.textSec} textAnchor="middle" transform={`rotate(-90 10 ${padT+plotH/2})`}>Error Rate (%)</text>
+        </svg>
+        <p style={{margin:"10px 0 0",fontSize:11,color:T.textSec,textAlign:"center",lineHeight:1.4}}>{hardest?`Q${hardest.q.num} shows the highest error rate. Consider reviewing this question's rubric.`:""}</p>
+      </div>
+    </div>
+  </div>);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   MOCK ASSIGNMENT DATA — 30 students × multiple questions each
+   Drives the Course cards and the AssignmentView analytics/table.
+   ═══════════════════════════════════════════════════════════ */
+// Globally diverse student roster (30 names, all ASCII-safe for email generation)
+const MOCK_NAMES=[
+  "Aisha Patel","Kenji Nakamura","Sofia Rodriguez","Darius Osei","Priya Sharma",
+  "Wei Chen","Olumide Adeyemi","Fatima Hassan","Lars Eriksson","Mateo Delgado",
+  "Ananya Iyer","Mehmet Yilmaz","Minh Nguyen","Zainab Hussain","Jiwon Park",
+  "Chiamaka Okafor","Rafael Silva","Lucia Moretti","Yusuf Kaya","Emma Muller",
+  "Hiroshi Tanaka","Amara Diallo","Isabella Rossi","Alexei Petrov","Tariq Rahman",
+  "Chloe Laurent","Arjun Kapoor","Nadia Ivanova","Samuel Mensah","Hana Suzuki"
+];
+
+// Each student belongs to one of a few email domains for visual variety
+const EMAIL_DOMAINS=["upenn.edu","seas.upenn.edu","sas.upenn.edu","wharton.upenn.edu"];
+
+// Seeded pseudo-random (deterministic so mock numbers are stable across renders)
+const sRand=(s)=>((s*9301+49297)%233280)/233280;
+
+// Question banks per assignment — pts sum matches the assignment total
+const MT_QS=[
+  {id:1,num:"1",title:"Basic Concepts",pts:15,type:"free",answerKey:"See key",page:1},
+  {id:2,num:"2",title:"Algorithm Implementation",pts:20,type:"free",answerKey:"See key",page:1},
+  {id:3,num:"3",title:"Recursive Problem Solving",pts:25,type:"free",answerKey:"See key",page:2},
+  {id:4,num:"4",title:"Time Complexity Analysis",pts:20,type:"free",answerKey:"See key",page:2},
+  {id:5,num:"5",title:"Data Structures",pts:20,type:"free",answerKey:"See key",page:3}
+];
+const HW_QS=[
+  {id:1,num:"1",title:"Warm-up Identification",pts:10,type:"free",answerKey:"See key",page:1},
+  {id:2,num:"2",title:"Fibonacci Recursion",pts:10,type:"free",answerKey:"See key",page:1},
+  {id:3,num:"3",title:"Tree Traversal",pts:10,type:"free",answerKey:"See key",page:2},
+  {id:4,num:"4",title:"Memoization Rewrite",pts:10,type:"free",answerKey:"See key",page:2},
+  {id:5,num:"5",title:"Mutual Recursion",pts:10,type:"free",answerKey:"See key",page:3}
+];
+// Per-question avg score targets (0-1) — creates realistic difficulty spread
+const MT_DIFF={1:0.83,2:0.81,3:0.58,4:0.75,5:0.89};
+const HW_DIFF={1:0.91,2:0.68,3:0.82,4:0.72,5:0.86};
+
+// Criteria labels shown in ExamInsights "common mistakes"
+const CRIT_TITLES={
+  1:["Correct definitions","Clear examples"],
+  2:["Off-by-one errors","Correct output"],
+  3:["Proper base case","Correct recursive step"],
+  4:["Accurate Big-O bound","Memory analysis"],
+  5:["Data structure choice","Implementation details"]
+};
+
+// Specific reasons shown on criterion cards — chosen deterministically per student
+const REASON_POOLS={
+  1:{
+    full:["Definition matches answer key precisely.","Accurate terminology with illustrative example.","Strong conceptual grasp demonstrated."],
+    partial:["Definition correct but missing one key term.","Example given but oversimplified.","Terminology slightly imprecise."],
+    zero:["Definition off-topic or circular.","No supporting example provided.","Fundamental misunderstanding of the concept."]
+  },
+  2:{
+    full:["Correct implementation with optimal logic.","Edge cases handled cleanly.","Algorithm well-structured and readable."],
+    partial:["Off-by-one error in loop bounds.","Edge case missed (empty input).","Minor logical slip in the inner loop."],
+    zero:["Algorithm fails on basic inputs.","Incorrect termination condition.","Logic fundamentally flawed."]
+  },
+  3:{
+    full:["Base case and recursive step both correct.","Elegant recursive formulation.","Terminates correctly for all inputs."],
+    partial:["Base case missing one sub-condition.","Recursive step double-counts on some inputs.","Will infinite-loop for negative inputs."],
+    zero:["No base case — stack overflow on any input.","Recursion does not reduce the problem.","Completely missed the recursive pattern."]
+  },
+  4:{
+    full:["Accurate Big-O with rigorous justification.","Correct complexity with tight bound.","Analysis shows deep understanding."],
+    partial:["Big-O bound off by a log factor.","Analysis lacks formal justification.","Space complexity analysis incomplete."],
+    zero:["Complexity stated is wildly incorrect.","Confuses time and space complexity.","No analysis provided."]
+  },
+  5:{
+    full:["Optimal data structure for the operations.","Clean API with correct invariants.","Handles all operations in expected time."],
+    partial:["Data structure works but not optimal for this workload.","Minor inefficiencies in common operations.","API design has one rough edge."],
+    zero:["Wrong data structure for the problem.","Core operations broken.","Significant design flaws throughout."]
+  }
+};
+
+function pickReason(pool,bucket,seed){
+  const arr=pool[bucket];return arr[Math.floor(sRand(seed)*arr.length)];
+}
+
+// Build a timestamp string "M/D/YYYY, H:MM:SS AM/PM" with day offset from deadline
+function stampFrom(baseDate,dayOffset,hour24,minute){
+  const[m,d,y]=baseDate.split("/").map(Number);
+  const dt=new Date(y,m-1,d);
+  dt.setDate(dt.getDate()+dayOffset);
+  const hr=((hour24-1)%12)+1;
+  const ampm=hour24>=12?"PM":"AM";
+  return `${dt.getMonth()+1}/${dt.getDate()}/${dt.getFullYear()}, ${hr}:${String(minute).padStart(2,"0")}:00 ${ampm}`;
+}
+
+function buildSubmissions(qs,diffMap,opts,dateBase,statusSeed=0){
+  const {gradedCount,submittedCount,lateCount}=opts;
+
+  // Permute student indices by statusSeed so DIFFERENT students miss DIFFERENT assignments.
+  // Skill is still keyed on original index — so a top student stays top across assignments.
+  const slotForStudent=new Array(MOCK_NAMES.length);
+  const permuted=MOCK_NAMES.map((_,i)=>i).sort((a,b)=>sRand(a*31+statusSeed*17+3)-sRand(b*31+statusSeed*17+3));
+  permuted.forEach((origIdx,slotIdx)=>{slotForStudent[origIdx]=slotIdx;});
+
+  return MOCK_NAMES.map((name,i)=>{
+    const slot=slotForStudent[i];
+    let status,graded;
+    if(slot<gradedCount){status="graded";graded=true;}
+    else if(slot<gradedCount+lateCount){status="late";graded=true;}
+    else if(slot<gradedCount+lateCount+submittedCount){status="submitted";graded=false;}
+    else{status="missing";graded=false;}
+
+    // Per-student "skill" — gives each student a coherent personality across all questions.
+    // Uniform in [-0.22, +0.22] creates realistic outliers at both ends.
+    const skill=(sRand(i*59+101)-0.5)*0.44;
+
+    const grades=graded?qs.map(q=>{
+      const d=diffMap[q.id]??0.80;
+      const noise=(sRand(i*37+q.id*13+statusSeed)-0.5)*0.18;
+      const pct=Math.max(0,Math.min(1,d+skill+noise));
+      const total=Math.round(pct*q.pts);
+      const c1Max=Math.ceil(q.pts*0.5);
+      const c2Max=q.pts-c1Max;
+      const c1E=Math.min(c1Max,total);
+      const c2E=Math.max(0,total-c1E);
+      const ts=q.crits||CRIT_TITLES[q.id]||["Part 1","Part 2"];
+      const pool=REASON_POOLS[q.id]||{full:["Full credit."],partial:["Partial credit."],zero:["Incorrect."]};
+      const bucket=(earn,max)=>earn===max?"full":earn===0?"zero":"partial";
+      return {qId:q.id,qNum:q.num,total,maxPts:q.pts,
+        criteria:[
+          {earned:c1E,maxPts:c1Max,title:ts[0],reason:pickReason(pool,bucket(c1E,c1Max),i*17+q.id*3)},
+          {earned:c2E,maxPts:c2Max,title:ts[1],reason:pickReason(pool,bucket(c2E,c2Max),i*23+q.id*7+1)}
+        ],
+        studentAnswer:"",feedback:"",
+        confidence:0.70+sRand(i*41+q.id*5)*0.28};
+    }):null;
+
+    const maxScore=qs.reduce((s,q)=>s+q.pts,0);
+    const totalScore=graded?grades.reduce((s,g)=>s+g.total,0):0;
+
+    const parts=name.split(" ");
+    const domain=EMAIL_DOMAINS[i%EMAIL_DOMAINS.length];
+    const email=`${parts[0].toLowerCase()}.${parts[1][0].toLowerCase()}@${domain}`;
+
+    // Submission timing: spread across 3 days before deadline + a few late entries
+    let submittedAt=null;
+    if(status!=="missing"){
+      const tr=sRand(i*79+11);
+      let dayOffset;
+      if(status==="late") dayOffset=1; // day after deadline
+      else if(tr<0.15) dayOffset=-2;   // ~15% submit 2 days early
+      else if(tr<0.45) dayOffset=-1;   // ~30% submit 1 day early
+      else dayOffset=0;                // rest on deadline day
+      // Evening hours mostly, with a few early birds
+      const hr=dayOffset===1?Math.floor(sRand(i*13)*3)+2 // late: 2-4 AM
+              :dayOffset<0?Math.floor(sRand(i*19)*10)+10 // early days: 10 AM - 7 PM
+              :Math.floor(sRand(i*29)*8)+16;             // deadline day: 4 PM - 11 PM
+      const mn=Math.floor(sRand(i*53+7)*60);
+      submittedAt=stampFrom(dateBase,dayOffset,hr,mn);
+    }
+
+    return {name,email,submittedAt,status,
+      grades,
+      totalScore,maxScore,
+      skill}; // keep skill for debugging / future use
+  });
+}
+
+const MIDTERM_SUBS=buildSubmissions(MT_QS,MT_DIFF,{gradedCount:22,lateCount:2,submittedCount:4},"3/15/2026",7);
+const HW5_SUBS=buildSubmissions(HW_QS,HW_DIFF,{gradedCount:25,lateCount:3,submittedCount:1},"4/1/2026",29);
+
+/* ── CIS 5450 question banks ── */
+const SQL_QS=[
+  {id:1,num:"1",title:"SELECT & WHERE",pts:10,type:"free",answerKey:"See key",page:1,crits:["Correct column selection","Accurate WHERE predicate"]},
+  {id:2,num:"2",title:"JOIN operations",pts:10,type:"free",answerKey:"See key",page:1,crits:["Correct JOIN type","Valid join condition"]},
+  {id:3,num:"3",title:"GROUP BY & Aggregates",pts:10,type:"free",answerKey:"See key",page:2,crits:["Correct grouping keys","Accurate aggregate function"]},
+  {id:4,num:"4",title:"Subqueries",pts:10,type:"free",answerKey:"See key",page:2,crits:["Correlated scope handled","Result composition correct"]},
+  {id:5,num:"5",title:"Window Functions",pts:10,type:"free",answerKey:"See key",page:3,crits:["PARTITION BY clause","ORDER BY within frame"]}
+];
+const PD_QS=[
+  {id:1,num:"1",title:"DataFrame Filtering",pts:10,type:"free",answerKey:"See key",page:1,crits:["Boolean mask correctness","Index preservation"]},
+  {id:2,num:"2",title:"GroupBy & Aggregation",pts:15,type:"free",answerKey:"See key",page:1,crits:["Grouping key choice","Aggregation function"]},
+  {id:3,num:"3",title:"Merge & Join",pts:15,type:"free",answerKey:"See key",page:2,crits:["Correct how= argument","Key alignment verified"]},
+  {id:4,num:"4",title:"NumPy Broadcasting",pts:10,type:"free",answerKey:"See key",page:2,crits:["Shape compatibility","Vectorized computation"]},
+  {id:5,num:"5",title:"Pivot Tables",pts:10,type:"free",answerKey:"See key",page:3,crits:["Index/columns split","Aggregation applied"]}
+];
+const SP_QS=[
+  {id:1,num:"1",title:"RDD Transformations",pts:10,type:"free",answerKey:"See key",page:1,crits:["Transformation choice","Lazy evaluation understood"]},
+  {id:2,num:"2",title:"Word Count",pts:10,type:"free",answerKey:"See key",page:1,crits:["Map step correctness","ReduceByKey logic"]},
+  {id:3,num:"3",title:"PageRank Iteration",pts:15,type:"free",answerKey:"See key",page:2,crits:["Contribution computation","Damping factor applied"]},
+  {id:4,num:"4",title:"Shuffle & Partitioning",pts:15,type:"free",answerKey:"See key",page:2,crits:["Partitioner choice","Shuffle cost analysis"]},
+  {id:5,num:"5",title:"Spark SQL",pts:10,type:"free",answerKey:"See key",page:3,crits:["DataFrame API usage","Query optimization"]}
+];
+const BDMT_QS=[
+  {id:1,num:"1",title:"CAP Theorem",pts:15,type:"free",answerKey:"See key",page:1,crits:["Trade-off explanation","System classification"]},
+  {id:2,num:"2",title:"Consistent Hashing",pts:20,type:"free",answerKey:"See key",page:1,crits:["Ring construction","Virtual node reasoning"]},
+  {id:3,num:"3",title:"MapReduce Design",pts:25,type:"free",answerKey:"See key",page:2,crits:["Mapper/reducer contract","Combiner justification"]},
+  {id:4,num:"4",title:"Stream Processing",pts:20,type:"free",answerKey:"See key",page:2,crits:["Windowing strategy","Watermark handling"]},
+  {id:5,num:"5",title:"Fault Tolerance",pts:20,type:"free",answerKey:"See key",page:3,crits:["Replication strategy","Recovery protocol"]}
+];
+const PROJ_QS=[
+  {id:1,num:"1",title:"Problem Statement",pts:10,type:"free",answerKey:"See key",page:1,crits:["Clear motivation","Measurable objective"]},
+  {id:2,num:"2",title:"Dataset Selection",pts:10,type:"free",answerKey:"See key",page:1,crits:["Data source justified","Size/scale feasible"]},
+  {id:3,num:"3",title:"Methodology",pts:10,type:"free",answerKey:"See key",page:2,crits:["Approach appropriate","Tooling realistic"]},
+  {id:4,num:"4",title:"Evaluation Plan",pts:10,type:"free",answerKey:"See key",page:2,crits:["Metric choice","Baseline comparison"]}
+];
+const SQL_DIFF={1:0.88,2:0.74,3:0.82,4:0.63,5:0.69};
+const PD_DIFF={1:0.86,2:0.79,3:0.71,4:0.64,5:0.77};
+const SP_DIFF={1:0.78,2:0.84,3:0.57,4:0.62,5:0.73};
+const BDMT_DIFF={1:0.81,2:0.66,3:0.59,4:0.71,5:0.76};
+const PROJ_DIFF={1:0.87,2:0.83,3:0.79,4:0.75};
+
+const SQL_SUBS=buildSubmissions(SQL_QS,SQL_DIFF,{gradedCount:27,lateCount:1,submittedCount:1},"2/5/2026",11);
+const PD_SUBS=buildSubmissions(PD_QS,PD_DIFF,{gradedCount:25,lateCount:2,submittedCount:2},"2/22/2026",23);
+const SP_SUBS=buildSubmissions(SP_QS,SP_DIFF,{gradedCount:24,lateCount:3,submittedCount:2},"3/13/2026",37);
+const BDMT_SUBS=buildSubmissions(BDMT_QS,BDMT_DIFF,{gradedCount:23,lateCount:2,submittedCount:3},"3/25/2026",53);
+const PROJ_SUBS=buildSubmissions(PROJ_QS,PROJ_DIFF,{gradedCount:20,lateCount:1,submittedCount:5},"4/10/2026",67);
+
+const ASSIGNMENTS_BY_COURSE={
+  // CIS 5450 — Big Data Analytics: 5 assignments, different students miss each
+  3:[
+    {id:"sql",title:"Homework 1: SQL Fundamentals",type:"homework",pts:50,due:"2/5/2026 at 11:59 PM",published:true,questions:SQL_QS,submissions:SQL_SUBS},
+    {id:"pd",title:"Homework 2: Pandas & NumPy",type:"homework",pts:60,due:"2/22/2026 at 11:59 PM",published:true,questions:PD_QS,submissions:PD_SUBS},
+    {id:"sp",title:"Homework 3: Spark MapReduce",type:"homework",pts:60,due:"3/13/2026 at 11:59 PM",published:true,questions:SP_QS,submissions:SP_SUBS},
+    {id:"bdmt",title:"Midterm: Distributed Systems",type:"exam",pts:100,due:"3/25/2026 at 11:59 PM",published:true,questions:BDMT_QS,submissions:BDMT_SUBS},
+    {id:"proj",title:"Final Project Proposal",type:"homework",pts:40,due:"4/10/2026 at 11:59 PM",published:true,questions:PROJ_QS,submissions:PROJ_SUBS}
+  ],
+  default:[
+    {id:"mt",title:"Midterm Exam II",type:"exam",pts:100,due:"3/15/2026 at 11:59 PM",published:true,questions:MT_QS,submissions:MIDTERM_SUBS},
+    {id:"hw5",title:"Homework 5: Recursion",type:"homework",pts:50,due:"4/1/2026 at 11:59 PM",published:true,questions:HW_QS,submissions:HW5_SUBS}
+  ]
+};
+const getAssignments=(courseId)=>ASSIGNMENTS_BY_COURSE[courseId]||ASSIGNMENTS_BY_COURSE.default;
+
+const STUDENT_CS=[
+  {id:1,code:"CIS 7000",name:"Large Language Models",term:"Spring 2026",students:180,assignments:2,color:"#4355DB"},
+  {id:2,code:"CIS 5220",name:"Reinforcement Learning",term:"Spring 2026",students:150,assignments:2,color:"#8B5CF6"},
+  {id:3,code:"CIS 5450",name:"Data Analytics",term:"Spring 2026",students:120,assignments:5,color:"#22A96B"}
+];
+const STUDENT_ASSIGNMENT_META={
+  1:[
+    {title:"Midterm: Transformer Language Models",questions:[
+      ["Scaled Dot-Product Attention","Q/K/V projection setup","Softmax scaling rationale"],
+      ["Positional Encodings","Sinusoidal position signal","Length generalization"],
+      ["Instruction Tuning vs RLHF","Supervised tuning objective","Preference optimization reasoning"],
+      ["Decoding & Evaluation","Temperature/top-p tradeoff","Metric limitation analysis"],
+      ["RAG Failure Modes","Retrieval grounding","Hallucination mitigation"]
+    ]},
+    {title:"Homework: RAG and Prompt Evaluation",questions:[
+      ["Chunking Strategy","Semantic chunk boundaries","Context-window tradeoff"],
+      ["Embedding Retrieval","Similarity metric choice","Recall@k analysis"],
+      ["Prompt Robustness","Few-shot example design","Ambiguity handling"],
+      ["Evaluation Harness","Test set coverage","Rubric-based scoring"],
+      ["Safety & Bias Review","Risk identification","Mitigation proposal"]
+    ]}
+  ],
+  2:[
+    {title:"Midterm: Reinforcement Learning Foundations",questions:[
+      ["Markov Decision Processes","State/action/reward definition","Transition dynamics"],
+      ["Bellman Equations","Value backup equation","Policy evaluation logic"],
+      ["Q-Learning","Temporal-difference target","Off-policy update"],
+      ["Policy Gradients","Log-probability gradient","Variance reduction baseline"],
+      ["Exploration Strategies","Epsilon-greedy tradeoff","Regret intuition"]
+    ]},
+    {title:"Homework: Deep RL Control",questions:[
+      ["DQN Stabilization","Replay buffer purpose","Target network update"],
+      ["Actor-Critic Methods","Actor objective","Critic advantage estimate"],
+      ["Reward Shaping","Potential-based shaping","Unintended incentive analysis"],
+      ["Offline RL","Distribution shift risk","Conservative value estimate"],
+      ["Evaluation Protocol","Seed variance reporting","Generalization test"]
+    ]}
+  ],
+  3:[
+    {title:"Homework 1: SQL Analytics",questions:[
+      ["Filtering Cohorts","Correct column selection","Predicate edge cases"],
+      ["JOIN Semantics","Correct join type","Join key validation"],
+      ["Grouped Metrics","Grouping key choice","Aggregate interpretation"],
+      ["Nested Queries","Subquery scope","Result composition"],
+      ["Window Functions","Partition/order clause","Frame interpretation"]
+    ]},
+    {title:"Homework 2: Pandas Feature Engineering",questions:[
+      ["DataFrame Filtering","Boolean mask correctness","Index preservation"],
+      ["GroupBy Aggregation","Grouping key choice","Aggregation function"],
+      ["Dataset Joins","Join mode selection","Key alignment checks"],
+      ["Vectorized NumPy","Shape compatibility","Broadcasted computation"],
+      ["Pivot Analysis","Index/columns split","Aggregation interpretation"]
+    ]},
+    {title:"Homework 3: Spark-Scale Analytics",questions:[
+      ["RDD Transformations","Transformation choice","Lazy evaluation"],
+      ["Distributed Word Count","Map step correctness","ReduceByKey logic"],
+      ["Iterative PageRank","Contribution computation","Damping factor"],
+      ["Shuffle Optimization","Partitioning strategy","Shuffle cost analysis"],
+      ["Spark SQL Plans","DataFrame API usage","Query optimization"]
+    ]},
+    {title:"Midterm: Data Systems for Analytics",questions:[
+      ["CAP Tradeoffs","Trade-off explanation","System classification"],
+      ["Consistent Hashing","Ring construction","Virtual node reasoning"],
+      ["MapReduce Design","Mapper/reducer contract","Combiner justification"],
+      ["Stream Processing","Windowing strategy","Watermark handling"],
+      ["Fault Tolerance","Replication strategy","Recovery protocol"]
+    ]},
+    {title:"Project Proposal: Analytics Pipeline",questions:[
+      ["Problem Statement","Clear motivation","Measurable objective"],
+      ["Dataset Selection","Data source justification","Scale feasibility"],
+      ["Methodology","Approach appropriateness","Tooling realism"],
+      ["Evaluation Plan","Metric choice","Baseline comparison"]
+    ]}
+  ]
+};
+const makeStudentFacingGrades=(questions,targetPct,seed=0)=>questions.map((q,i)=>{
+  const pct=Math.max(0.72,Math.min(0.98,targetPct+(sRand(seed*31+i*17)-0.5)*0.12));
+  const total=Math.round(pct*q.pts);
+  const c1Max=Math.ceil(q.pts*0.5);
+  const c2Max=q.pts-c1Max;
+  const c1E=Math.min(c1Max,total);
+  const c2E=Math.max(0,total-c1E);
+  const titles=q.crits||CRIT_TITLES[q.id]||["Conceptual accuracy","Technical execution"];
+  const reason=(earned,max,title)=>earned===max?`Strong work on ${title.toLowerCase()}; the answer matches the expected reasoning.`:earned===0?`This part needs a full revision; the submitted answer does not yet address ${title.toLowerCase()}.`:`Mostly correct, but ${title.toLowerCase()} needs a more precise explanation or edge-case treatment.`;
+  return {qId:q.id,qNum:q.num,total,maxPts:q.pts,
+    criteria:[
+      {earned:c1E,maxPts:c1Max,title:titles[0],reason:reason(c1E,c1Max,titles[0])},
+      {earned:c2E,maxPts:c2Max,title:titles[1],reason:reason(c2E,c2Max,titles[1])}
+    ],
+    studentAnswer:"",feedback:"",confidence:0.86+sRand(seed*43+i*11)*0.12};
+});
+const applyStudentMeta=(assignment,meta={})=>{
+  const questions=(assignment.questions||[]).map((q,i)=>{
+    const m=meta.questions?.[i];
+    return m?{...q,title:m[0],crits:[m[1],m[2]]}:q;
+  });
+  const title=meta.title||assignment.title;
+  const isHomework=title.toLowerCase().includes("homework");
+  const submissions=assignment.submissions.map((s,si)=>{
+    if(isHomework){
+      const targetPct=0.88+sRand(si*23+7)*0.08;
+      const grades=makeStudentFacingGrades(questions,targetPct,si+3);
+      return {...s,status:"graded",submittedAt:s.submittedAt||"3/31/2026, 8:42:00 PM",grades,totalScore:grades.reduce((sum,g)=>sum+g.total,0),maxScore:questions.reduce((sum,q)=>sum+q.pts,0)};
+    }
+    return !s.grades?s:{...s,grades:s.grades.map((g,gi)=>{
+    const m=meta.questions?.[gi];
+    return !m?g:{...g,criteria:(g.criteria||[]).map((c,ci)=>({...c,title:m[ci+1]||c.title}))};
+  })};
+  });
+  return {...assignment,title,questions,submissions};
+};
+const getStudentAssignments=(courseId)=>getAssignments(courseId).map((a,i)=>applyStudentMeta(a,STUDENT_ASSIGNMENT_META[courseId]?.[i]));
+
+const DEMO_STUDENT_NAME=MOCK_NAMES[0];
+const getStudentSubmission=(assignment,studentName=DEMO_STUDENT_NAME)=>assignment.submissions.find(s=>s.name===studentName)||assignment.submissions[0];
+const pctOf=(score,max)=>max>0?(score/max)*100:0;
+const classAverageFor=(assignment)=>{
+  const graded=assignment.submissions.filter(s=>s.grades);
+  if(!graded.length)return 0;
+  return graded.reduce((sum,s)=>sum+pctOf(s.totalScore,s.maxScore),0)/graded.length;
+};
+const classAverageForQuestion=(assignment,qId)=>{
+  const grades=assignment.submissions.flatMap(s=>s.grades?.find(g=>g.qId===qId)||[]);
+  if(!grades.length)return 0;
+  return grades.reduce((sum,g)=>sum+pctOf(g.total,g.maxPts),0)/grades.length;
+};
+const studentStrengths=(submission)=>{
+  const items=(submission?.grades||[]).flatMap(g=>(g.criteria||[]).filter(c=>c.earned===c.maxPts).map(c=>c.title));
+  return [...new Set(items)].slice(0,3);
+};
+const studentImprovements=(submission)=>{
+  const items=(submission?.grades||[]).flatMap(g=>(g.criteria||[]).filter(c=>c.earned<c.maxPts).map(c=>c.title));
+  return [...new Set(items)].slice(0,3);
+};
+const studentAiComments=(submission,assignment)=>{
+  if(!submission?.grades)return ["Your instructor has not released AI grading comments yet."];
+  const pct=pctOf(submission.totalScore,submission.maxScore);
+  const strongest=[...submission.grades].sort((a,b)=>pctOf(b.total,b.maxPts)-pctOf(a.total,a.maxPts))[0];
+  const weakest=[...submission.grades].sort((a,b)=>pctOf(a.total,a.maxPts)-pctOf(b.total,b.maxPts))[0];
+  const comments=[
+    pct>=85?`Excellent work on ${assignment.title}. Your answers show strong command of the main concepts and consistent execution across questions.`:pct>=70?`Good work overall on ${assignment.title}. You are close to mastery; the remaining point losses are concentrated in a few specific skills.`:`This submission shows effort, but several core concepts need a second pass before the next assessment.`,
+    strongest?`Your strongest response was Q${strongest.qNum}, where the rubric shows the clearest evidence of correct reasoning.`:"Your stronger rubric items show a useful foundation to build on.",
+    weakest&&weakest.total<weakest.maxPts?`The biggest opportunity is Q${weakest.qNum}. Review the feedback there first because it accounts for the largest remaining score gap.`:"No single question stands out as a major weakness."
+  ];
+  return comments;
+};
+const studentHelpfulSuggestions=(submission)=>{
+  if(!submission?.grades)return ["Check back after grading is released for personalized next steps."];
+  const missed=submission.grades.flatMap(g=>(g.criteria||[]).filter(c=>c.earned<c.maxPts).map(c=>({q:g.qNum,...c})));
+  if(!missed.length)return ["Redo one high-scoring question without notes to confirm you can reproduce the method independently.","Compare your solution with the rubric and write down the exact habits that earned full credit."];
+  return missed.slice(0,4).map(c=>`For Q${c.q}, revisit "${c.title}": ${c.reason} Then write one corrected version and mark where the missing rubric point should be earned.`);
+};
+const criterionTone=(c)=>{
+  if(c.earned===c.maxPts)return{label:"Full credit",color:T.green,bg:T.greenLight,icon:"check"};
+  if(c.earned===0)return{label:"Needs work",color:T.red,bg:"#FEF2F2",icon:"x"};
+  return{label:"Partial",color:T.orange,bg:T.orangeLight,icon:"warn"};
+};
+
+function StudentDashboard({onSelect,studentName=DEMO_STUDENT_NAME}){
+  const courses=STUDENT_CS.map(c=>{
+    const assignments=getStudentAssignments(c.id);
+    const studentSubs=assignments.map(a=>({assignment:a,sub:getStudentSubmission(a,studentName)}));
+    const graded=studentSubs.filter(x=>x.sub?.grades);
+    const avg=graded.length?graded.reduce((s,x)=>s+pctOf(x.sub.totalScore,x.sub.maxScore),0)/graded.length:0;
+    const next=studentSubs.find(x=>x.sub?.status!=="graded")?.assignment||assignments[0];
+    return {...c,assignments,gradedCount:graded.length,avg,next};
+  });
+  return(<div style={_ctr}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",marginBottom:30}}>
+      <div><h1 style={{fontSize:30,fontWeight:900,margin:"0 0 4px"}}>Your Courses</h1><p style={{color:T.textSec,margin:0,fontSize:14}}>Welcome back, {studentName}</p></div>
+      <div style={{background:`linear-gradient(135deg,${T.primary}12,${T.purple}10)`,border:`1px solid ${T.primary}18`,borderRadius:T.r,padding:"12px 16px",fontSize:12,fontWeight:800,color:T.primary}}>Student View</div>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(320px,1fr))",gap:18}}>
+      {courses.map(c=><div key={c.id} onClick={()=>onSelect(c)} style={{..._card,cursor:"pointer"}}
+        onMouseEnter={e=>{e.currentTarget.style.boxShadow=T.shM;e.currentTarget.style.transform="translateY(-2px)";}}
+        onMouseLeave={e=>{e.currentTarget.style.boxShadow="none";e.currentTarget.style.transform="translateY(0)";}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:18}}>
+          <div style={{width:48,height:48,borderRadius:12,background:`linear-gradient(135deg,${c.color},${T.purple})`}}/>
+          <div style={{minWidth:0}}><h3 style={{margin:0,fontSize:18,fontWeight:900}}>{c.code}</h3><p style={{margin:0,fontSize:13,color:T.textSec,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{c.name}</p></div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+          <div style={{background:"#F8F9FC",borderRadius:T.rs,padding:"10px 12px"}}><div style={{fontSize:11,color:T.textSec,fontWeight:700}}>Average</div><div style={{fontSize:22,fontWeight:900}}>{c.avg.toFixed(0)}%</div></div>
+          <div style={{background:"#F8F9FC",borderRadius:T.rs,padding:"10px 12px"}}><div style={{fontSize:11,color:T.textSec,fontWeight:700}}>Graded</div><div style={{fontSize:22,fontWeight:900}}>{c.gradedCount}/{c.assignments.length}</div></div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:T.textSec}}><Calendar size={14}/>{c.next?`Next: ${c.next.title}`:"No assignments"}</div>
+      </div>)}
+    </div>
+  </div>);
+}
+
+function StudentCourse({course,onBack,onAssignment,studentName=DEMO_STUDENT_NAME}){
+  const assignments=getStudentAssignments(course.id);
+  const rows=assignments.map(a=>({assignment:a,sub:getStudentSubmission(a,studentName),classAvg:classAverageFor(a)}));
+  const gradedRows=rows.filter(r=>r.sub?.grades);
+  const avg=gradedRows.length?gradedRows.reduce((s,r)=>s+pctOf(r.sub.totalScore,r.sub.maxScore),0)/gradedRows.length:0;
+  const statusStyle=s=>s==="graded"?{background:T.text,color:"#fff"}:s==="late"?{background:T.orangeLight,color:T.orange}:s==="missing"?{background:"#FEE8E8",color:T.red}:{background:"#ECEDF3",color:T.textSec};
+  return(<div style={_ctr}>
+    <div onClick={onBack} style={{display:"inline-flex",alignItems:"center",gap:5,color:T.textSec,cursor:"pointer",marginBottom:16,fontSize:13,fontWeight:500}}><ChevronLeft size={16}/>Back to Courses</div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:24}}>
+      <div style={{display:"flex",alignItems:"center",gap:14}}><div style={{width:52,height:52,borderRadius:14,background:course.color}}/><div><h1 style={{fontSize:28,fontWeight:900,margin:"0 0 2px"}}>{course.code}</h1><p style={{margin:0,color:T.textSec,fontSize:14}}>{course.name}</p></div></div>
+      <div style={{textAlign:"right"}}><div style={{fontSize:12,fontWeight:800,color:T.textSec,textTransform:"uppercase"}}>Course Average</div><div style={{fontSize:30,fontWeight:900,color:T.primary}}>{avg.toFixed(0)}%</div></div>
+    </div>
+    <h2 style={{fontSize:22,fontWeight:900,margin:"0 0 16px"}}>Assignments</h2>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(360px,1fr))",gap:18}}>
+      {rows.map(({assignment:a,sub,classAvg})=>{
+        const graded=!!sub?.grades;
+        const p=graded?pctOf(sub.totalScore,sub.maxScore):0;
+        const isExam=a.type==="exam";
+        return(<div key={a.id} onClick={()=>onAssignment(a)} style={{..._card,cursor:"pointer"}}
+          onMouseEnter={e=>{e.currentTarget.style.boxShadow=T.shM;e.currentTarget.style.transform="translateY(-2px)";}}
+          onMouseLeave={e=>{e.currentTarget.style.boxShadow="none";e.currentTarget.style.transform="translateY(0)";}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+            <div style={{minWidth:0,marginRight:14}}><h3 style={{margin:"0 0 10px",fontSize:18,fontWeight:900,lineHeight:1.25}}>{a.title}</h3><div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              <span style={{padding:"4px 14px",borderRadius:T.rr,fontSize:11,fontWeight:800,background:isExam?"#FEE8E8":T.primaryLight,color:isExam?T.red:T.primary}}>{a.type}</span>
+              <span style={{padding:"4px 14px",borderRadius:T.rr,fontSize:11,fontWeight:800,...statusStyle(sub?.status)}}>{sub?.status||"missing"}</span>
+            </div></div>
+            <div style={{textAlign:"right",flexShrink:0}}><div style={{fontSize:30,fontWeight:900,lineHeight:1}}>{graded?sub.totalScore:a.pts}</div><div style={{fontSize:12,color:T.textSec,marginTop:2}}>{graded?`/${sub.maxScore} pts`:"points"}</div></div>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:T.textSec,marginBottom:12}}><Calendar size={14}/>Due: {a.due}</div>
+          {graded?<>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12,fontWeight:700,marginBottom:6}}><span>Your score</span><span>{p.toFixed(0)}% · class avg {classAvg.toFixed(0)}%</span></div>
+            <div style={{height:8,borderRadius:T.rr,background:"#D9DBE3",overflow:"hidden"}}><div style={{height:"100%",width:`${p}%`,background:`linear-gradient(90deg,${T.primary},${T.purple})`,borderRadius:T.rr}}/></div>
+          </>:<div style={{fontSize:12,color:T.textSec}}>Feedback will appear after this assignment is graded.</div>}
+        </div>);
+      })}
+    </div>
+  </div>);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ASSIGNMENT VIEW — detail page with Submissions / Analytics tabs
+   ═══════════════════════════════════════════════════════════ */
+function StudentAssignmentDetail({assignment,course,onBack,studentName=DEMO_STUDENT_NAME}){
+  const sub=getStudentSubmission(assignment,studentName);
+  const graded=!!sub?.grades;
+  const classAvg=classAverageFor(assignment);
+  const scorePct=graded?pctOf(sub.totalScore,sub.maxScore):0;
+  const dueParts=assignment.due.split(" at ");
+  const strengths=studentStrengths(sub);
+  const improvements=studentImprovements(sub);
+  const aiSummary=scorePct>=85?"Strong performance overall. Keep using the same preparation strategy, then tighten the few remaining details.":scorePct>=70?"Solid understanding with a few targeted gaps. Focus review on the lower-scoring questions below.":"This assignment needs a focused review pass. Start with the improvement list, then redo the lowest-scoring question.";
+  const aiComments=studentAiComments(sub,assignment);
+  const helpfulSuggestions=studentHelpfulSuggestions(sub);
+  const bullet=(color,text)=><li key={text} style={{marginBottom:14,color:T.textSec,lineHeight:1.45}}><span style={{color,fontWeight:900,marginRight:8}}>•</span>{text}</li>;
+  return(<div style={_ctr}>
+    <div onClick={onBack} style={{display:"inline-flex",alignItems:"center",gap:5,color:T.textSec,cursor:"pointer",marginBottom:28,fontSize:13,fontWeight:500}}><ChevronLeft size={16}/>Back to {course.code}</div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28}}>
+      <div><h1 style={{fontSize:34,fontWeight:900,margin:"0 0 8px"}}>{assignment.title}</h1><p style={{margin:0,color:T.textSec,fontSize:17}}>{course.name}</p></div>
+      <span style={{background:T.text,color:"#fff",fontWeight:900,fontSize:16,padding:"14px 24px",borderRadius:T.rs}}>{graded?"Graded":sub?.status||"Missing"}</span>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr",gap:18,marginBottom:22}}>
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"28px 30px"}}>
+        <div style={{fontSize:14,fontWeight:800,color:T.textSec,marginBottom:28}}>Your Score</div>
+        <div style={{fontSize:34,fontWeight:900,marginBottom:20}}>{graded?`${sub.totalScore}/${sub.maxScore}`:"Not graded"} {graded&&<span style={{fontSize:22,color:T.textSec,fontWeight:600}}>({scorePct.toFixed(1)}%)</span>}</div>
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:14,color:T.textSec,fontWeight:700,marginBottom:8}}><span>Score progress</span><span>{scorePct.toFixed(0)}%</span></div>
+        <div style={{height:10,borderRadius:T.rr,background:"#D8DAE2",overflow:"hidden"}}><div style={{height:"100%",width:`${scorePct}%`,background:`linear-gradient(90deg,${T.primary},${T.purple})`,borderRadius:T.rr}}/></div>
+      </div>
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"28px 30px",display:"flex",flexDirection:"column",justifyContent:"center"}}>
+        <div style={{fontSize:14,fontWeight:800,color:T.textSec,marginBottom:24}}>Class Average</div>
+        <div style={{fontSize:30,fontWeight:900}}>{classAvg.toFixed(1)}/100</div>
+        <div style={{fontSize:14,color:T.textSec,marginTop:8}}>{classAvg.toFixed(1)}%</div>
+      </div>
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"28px 30px",display:"flex",flexDirection:"column",justifyContent:"center"}}>
+        <div style={{fontSize:14,fontWeight:800,color:T.textSec,marginBottom:24}}>Due Date</div>
+        <div style={{fontSize:18,fontWeight:800}}>{dueParts[0]}</div>
+        <div style={{fontSize:14,color:T.textSec,marginTop:6}}>{dueParts[1]}</div>
+      </div>
+    </div>
+    <div style={{background:`linear-gradient(90deg,${T.primary}0F,#FFFFFF)`,border:`1px solid ${T.primary}20`,borderRadius:T.r,padding:"18px 22px",marginBottom:22,display:"flex",gap:10}}>
+      <Sparkles size={18} color={T.primary} style={{marginTop:2,flexShrink:0}}/><div><div style={{fontWeight:900,marginBottom:4}}>AI Summary</div><p style={{margin:0,fontSize:13,color:T.textSec,lineHeight:1.55}}>{graded?aiSummary:"Your instructor has not released grading feedback yet."}</p></div>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18,marginBottom:22}}>
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"22px 26px",boxShadow:T.sh}}>
+        <h2 style={{display:"flex",alignItems:"center",gap:10,fontSize:18,fontWeight:900,margin:"0 0 12px"}}><MessageCircle size={18} color={T.purple}/>AI Grading Comments</h2>
+        <p style={{margin:"0 0 14px",fontSize:13,color:T.textSec,lineHeight:1.5}}>Personalized comments generated from your rubric results.</p>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {aiComments.map((c,i)=><div key={i} style={{display:"flex",gap:10,background:`${T.purple}08`,border:`1px solid ${T.purple}18`,borderRadius:T.rs,padding:"10px 12px"}}>
+            <div style={{width:22,height:22,borderRadius:"50%",background:T.purpleLight,color:T.purple,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:11,flexShrink:0}}>{i+1}</div>
+            <p style={{margin:0,fontSize:12,color:T.textSec,lineHeight:1.5}}>{c}</p>
+          </div>)}
+        </div>
+      </div>
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"22px 26px",boxShadow:T.sh}}>
+        <h2 style={{display:"flex",alignItems:"center",gap:10,fontSize:18,fontWeight:900,margin:"0 0 12px"}}><Lightbulb size={18} color={T.primary}/>Helpful Suggestions</h2>
+        <p style={{margin:"0 0 14px",fontSize:13,color:T.textSec,lineHeight:1.5}}>Concrete next steps to improve before the next assignment.</p>
+        <div style={{display:"flex",flexDirection:"column",gap:9}}>
+          {helpfulSuggestions.map((s,i)=><div key={i} style={{display:"grid",gridTemplateColumns:"24px 1fr",gap:10,alignItems:"flex-start"}}>
+            <div style={{width:20,height:20,borderRadius:"50%",background:T.primaryLight,color:T.primary,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:10}}>{i+1}</div>
+            <p style={{margin:0,fontSize:12,color:T.textSec,lineHeight:1.55}}>{s}</p>
+          </div>)}
+        </div>
+      </div>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:18,marginBottom:30}}>
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"26px 30px"}}>
+        <h2 style={{display:"flex",alignItems:"center",gap:10,fontSize:20,fontWeight:900,margin:"0 0 14px"}}><CheckCircle2 size={18} color={T.green}/>Strengths</h2>
+        <p style={{margin:"0 0 22px",fontSize:15,color:T.textSec}}>What you did well on this assignment</p>
+        <ul style={{listStyle:"none",padding:0,margin:0}}>{(strengths.length?strengths:["Clear effort shown in submitted work."]).map(t=>bullet(T.green,t))}</ul>
+      </div>
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"26px 30px"}}>
+        <h2 style={{display:"flex",alignItems:"center",gap:10,fontSize:20,fontWeight:900,margin:"0 0 14px"}}><Sparkles size={18} color={T.primary}/>Areas for Improvement</h2>
+        <p style={{margin:"0 0 22px",fontSize:15,color:T.textSec}}>Concepts to review and practice</p>
+        <ul style={{listStyle:"none",padding:0,margin:0}}>{(improvements.length?improvements:["Keep practicing transfer problems to maintain mastery."]).map(t=>bullet(T.primary,t))}</ul>
+      </div>
+    </div>
+    <h2 style={{fontSize:26,fontWeight:900,margin:"0 0 6px"}}>Question Breakdown</h2>
+    <p style={{margin:"0 0 18px",fontSize:14,color:T.textSec}}>Detailed feedback and improvement suggestions for each question</p>
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      {(assignment.questions||[]).map(q=>{
+        const g=sub?.grades?.find(x=>x.qId===q.id);
+        const qp=g?pctOf(g.total,g.maxPts):0;
+        const qAvg=classAverageForQuestion(assignment,q.id);
+        const above=qp>=qAvg;
+        const misses=(g?.criteria||[]).filter(c=>c.earned<c.maxPts);
+        const wins=(g?.criteria||[]).filter(c=>c.earned===c.maxPts);
+        const criteria=g?.criteria||[];
+        return(<div key={q.id} style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"24px 28px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
+            <div><div style={{display:"flex",alignItems:"center",gap:12,marginBottom:10}}><h3 style={{fontSize:20,fontWeight:900,margin:0}}>Question {q.num}</h3><span style={{background:T.text,color:"#fff",borderRadius:T.rs,padding:"6px 12px",fontSize:12,fontWeight:900}}>{g?`${g.total}/${g.maxPts} pts`:"-"}</span></div><p style={{margin:0,color:T.textSec,fontSize:14}}>{q.title}</p></div>
+            {graded&&<div style={{fontSize:14,fontWeight:900,color:above?T.green:T.orange,display:"flex",alignItems:"center",gap:6}}><TrendingUp size={15}/>{above?"Above avg":"Below avg"}</div>}
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:T.textSec,marginBottom:8}}><span>Your score: {qp.toFixed(0)}%</span><span>Class avg: {qAvg.toFixed(0)}%</span></div>
+          <div style={{height:8,borderRadius:T.rr,background:"#D8DAE2",overflow:"hidden",marginBottom:22}}><div style={{height:"100%",width:`${qp}%`,background:`linear-gradient(90deg,${above?T.green:T.primary},${above?T.green:T.purple})`,borderRadius:T.rr}}/></div>
+          <div style={{display:"flex",alignItems:"flex-start",gap:9,marginBottom:16}}><Sparkles size={16} color={T.purple} style={{marginTop:2}}/><div><div style={{fontWeight:900,fontSize:14,marginBottom:6}}>AI Feedback</div><p style={{margin:0,fontSize:13,color:T.textSec,lineHeight:1.55}}>{misses[0]?`Focus on ${misses[0].title.toLowerCase()}: ${misses[0].reason}`:wins[0]?`Nice work on ${wins[0].title.toLowerCase()}: ${wins[0].reason}`:"Feedback will appear once grading is released."}</p></div></div>
+          {criteria.length>0&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:10,marginBottom:16}}>
+            {criteria.map(c=>{const tone=criterionTone(c);return(<div key={c.title} style={{background:tone.bg,border:`1px solid ${tone.color}24`,borderRadius:T.rs,padding:"11px 13px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                <div style={{display:"flex",alignItems:"center",gap:7,fontWeight:900,fontSize:12,color:T.text}}>{tone.icon==="check"?<CheckCircle2 size={13} color={tone.color}/>:tone.icon==="x"?<X size={13} color={tone.color}/>:<AlertCircle size={13} color={tone.color}/>} {c.title}</div>
+                <span style={{fontWeight:900,fontSize:12,color:tone.color}}>{c.earned}/{c.maxPts}</span>
+              </div>
+              <div style={{fontSize:10,fontWeight:900,color:tone.color,textTransform:"uppercase",marginBottom:4}}>{tone.label}</div>
+              <p style={{margin:0,fontSize:11,color:T.textSec,lineHeight:1.45}}>{c.reason}</p>
+            </div>);})}
+          </div>}
+          {misses.length>0&&<div style={{background:`${T.primary}08`,border:`1px solid ${T.primary}18`,borderRadius:T.rs,padding:"14px 16px"}}><div style={{display:"flex",alignItems:"center",gap:8,fontWeight:900,color:T.primary,marginBottom:8}}><Lightbulb size={15}/>Helpful Suggestions</div><ul style={{margin:0,paddingLeft:18,color:T.primary,fontSize:13,lineHeight:1.8}}>{misses.slice(0,2).map(c=><li key={c.title}>Revise "{c.title}" by correcting the issue noted here: {c.reason}</li>)}</ul></div>}
+        </div>);
+      })}
+    </div>
+  </div>);
+}
+
+function AssignmentView({assignment,course,onBack}){
+  const[tab,setTab]=useState("submissions");
+  const a=assignment;
+  // Both "graded" and "late" (graded late submissions) feed analytics
+  const gradedSubs=a.submissions.filter(s=>s.grades);
+  const gradingResults=gradedSubs.map(s=>({file:{name:s.name},grades:s.grades,totalScore:s.totalScore,maxScore:s.maxScore}));
+
+  const isExam=a.type==="exam";
+  const typeBadge={padding:"4px 14px",borderRadius:T.rr,fontSize:11,fontWeight:700,textTransform:"lowercase",background:isExam?"#FEE8E8":T.primaryLight,color:isExam?T.red:T.primary};
+  const pubBadge={padding:"4px 14px",borderRadius:T.rr,fontSize:11,fontWeight:700,background:T.text,color:"#fff"};
+
+  // Status badge palette
+  const statusStyle=(s)=>{
+    if(s==="graded")return{background:T.text,color:"#fff"};
+    if(s==="late")return{background:T.orangeLight,color:T.orange};
+    if(s==="missing")return{background:"#FEE8E8",color:T.red};
+    return{background:"#ECEDF3",color:T.textSec}; // submitted
+  };
+
+  const tabs=[{k:"submissions",l:"Submissions"},{k:"analytics",l:"Analytics"}];
+
+  return(<div style={_ctr}>
+    <div onClick={onBack} style={{display:"inline-flex",alignItems:"center",gap:5,color:T.textSec,cursor:"pointer",marginBottom:16,fontSize:13,fontWeight:500}}><ChevronLeft size={16}/>Back to {course.code}</div>
+
+    {/* Header */}
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:22}}>
+      <div>
+        <h1 style={{fontSize:28,fontWeight:900,margin:"0 0 10px"}}>{a.title}</h1>
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          <span style={typeBadge}>{a.type}</span>
+          {a.published&&<span style={pubBadge}>published</span>}
+        </div>
+        <div style={{display:"flex",gap:18,flexWrap:"wrap",fontSize:13,color:T.textSec}}>
+          <span style={{display:"inline-flex",alignItems:"center",gap:6,color:T.red}}><Calendar size={14}/>Due: {a.due}</span>
+          <span style={{display:"inline-flex",alignItems:"center",gap:6}}><Star size={14}/>{a.pts} points</span>
+          <span style={{display:"inline-flex",alignItems:"center",gap:6}}><FileText size={14}/>{a.submissions.length} submissions</span>
+          <span style={{display:"inline-flex",alignItems:"center",gap:6}}><CheckCircle2 size={14} color={T.green}/>{gradedSubs.length}/{a.submissions.length} graded</span>
+        </div>
+      </div>
+    </div>
+
+    {/* Tabs */}
+    <div style={{display:"flex",gap:4,borderBottom:`1px solid ${T.border}`,marginBottom:20}}>
+      {tabs.map(t=>{const active=tab===t.k;return(
+        <button key={t.k} onClick={()=>setTab(t.k)} style={{padding:"11px 22px",border:"none",background:"transparent",fontFamily:T.font,fontSize:14,fontWeight:700,cursor:"pointer",color:active?T.primary:T.textSec,borderBottom:`2.5px solid ${active?T.primary:"transparent"}`,marginBottom:-1}}>{t.l}</button>
+      );})}
+    </div>
+
+    {tab==="submissions"&&(
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,overflow:"hidden"}}>
+        <div style={{padding:"18px 24px",borderBottom:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <h3 style={{margin:0,fontSize:16,fontWeight:800}}>All Submissions</h3>
+          <span style={{fontSize:12,color:T.textSec}}>Showing {a.submissions.length} students</span>
+        </div>
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr style={{background:"#FAFBFE"}}>
+              {["Student","Email","Submitted","Status","Score"].map((h,i)=>(
+                <th key={i} style={{padding:"12px 24px",textAlign:i===4?"right":"left",fontWeight:700,fontSize:12,color:T.textSec,borderBottom:`1px solid ${T.border}`}}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {a.submissions.map((s,i)=>{
+                const hasScore=!!s.grades;
+                const pct=hasScore?s.totalScore/s.maxScore:0;
+                const scColor=pct>=0.8?T.green:pct>=0.6?T.text:T.red;
+                const stStyle=statusStyle(s.status);
+                return(<tr key={i} style={{borderBottom:i<a.submissions.length-1?`1px solid ${T.border}`:"none"}}>
+                  <td style={{padding:"14px 24px",fontWeight:700,fontSize:13}}>{s.name}</td>
+                  <td style={{padding:"14px 24px",fontSize:13,color:T.textSec}}>{s.email}</td>
+                  <td style={{padding:"14px 24px",fontSize:13,color:T.textSec}}>{s.submittedAt||"—"}</td>
+                  <td style={{padding:"14px 24px"}}>
+                    <span style={{padding:"4px 14px",borderRadius:T.rr,fontSize:11,fontWeight:700,...stStyle}}>{s.status}</span>
+                  </td>
+                  <td style={{padding:"14px 24px",textAlign:"right",fontWeight:800,fontSize:13,color:hasScore?scColor:T.textSec}}>{hasScore?`${s.totalScore}/${s.maxScore}`:"—"}</td>
+                </tr>);
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    )}
+
+    {tab==="analytics"&&(
+      gradingResults.length
+        ?<ExamInsights gradingResults={gradingResults} questions={a.questions}/>
+        :<div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"48px 32px",textAlign:"center"}}>
+          <AlertCircle size={28} color={T.textSec} style={{marginBottom:10}}/>
+          <p style={{margin:0,color:T.textSec,fontSize:14}}>No graded submissions yet — analytics will appear once grading starts.</p>
+        </div>
+    )}
+  </div>);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -267,10 +1359,11 @@ function CreateExam({course,onBack}){
   const[expandedQ,setExpandedQ]=useState(null);
   const[activeRubricQ,setActiveRubricQ]=useState(0);
   const[newCrit,setNewCrit]=useState({title:"",pts:""});
-  const[isDetectingBoxes,setIsDetectingBoxes]=useState(false);
   const [rightWidth, setRightWidth] = useState(300);
-  const [resizing, setResizing] = useState(false);
   const rightPanelWidthRef = useRef(300);
+  const [pendingBox, setPendingBox] = useState(null);
+  const [pdfTotalPages, setPdfTotalPages] = useState(1);
+  const [pageTexts, setPageTexts] = useState({});
 
   const next=()=>setStep(s=>Math.min(s+1,5));
   const prev=()=>setStep(s=>Math.max(s-1,0));
@@ -284,92 +1377,60 @@ function CreateExam({course,onBack}){
   };
 
   /* PDF text extraction using PDF.js to detect question positions */
-  const extractTextPositions = async (file) => {
-    if(!file) return null;
-    try{
-      const ab = await file.arrayBuffer();
-      const loadingTask = pdfjsLib.getDocument({ data: ab });
-      const pdf = await loadingTask.promise;
-      const pages = {};
-      for(let p=1;p<=pdf.numPages;p++){
-        const page = await pdf.getPage(p);
-        const viewport = page.getViewport({ scale: 1 });
-        const textContent = await page.getTextContent();
-        const items = textContent.items.map(it=>{
-          const tm = it.transform || [1,0,0,1,0,0];
-          const x = tm[4] || 0;
-          const y = tm[5] || 0;
-          const fontHeight = Math.abs(tm[3]) || 12;
-          const str = it.str || "";
-          return { str, x, y, fontHeight, width: it.width || (str.length * fontHeight * 0.6) };
-        });
-        pages[p] = { items, width: viewport.width, height: viewport.height };
-      }
-      return pages;
-    }catch(err){console.warn('PDF text extraction failed',err);return null;}
-  };
-
-  const detectBoxesFromText = (pages, questionsList) => {
-    const found = [];
-    if(!pages) return found;
-    for(const q of questionsList){
-      const pgNum = q.page || 1;
-      const pg = pages[pgNum];
-      if(!pg) continue;
-      const items = pg.items || [];
-      const qRegex = new RegExp(`^\\s*${q.num}(?:[\\)\\.\\s]|$)`);
-      let idx = items.findIndex(it=>qRegex.test(it.str));
-      if(idx===-1){ // fallback: look for the number anywhere in the string
-        idx = items.findIndex(it=>it.str && it.str.includes(`${q.num}`));
-      }
-      if(idx!==-1){
-        const it = items[idx];
-        // pdf.js Y origin is bottom; overlay uses top => invert
-        const yPct = ((pg.height - it.y) / pg.height) * 100;
-        const hPct = Math.min(30, (it.fontHeight * 3 / pg.height) * 100);
-        found.push({
-          id: q.id,
-          label: `Q${q.num}`,
-          x: 5,
-          y: Math.max(0, yPct - 1),
-          w: 90,
-          h: Math.max(10, hPct),
-          page: pgNum,
-          type: 'answer',
-          pts: q.pts,
-          qtype: q.type
-        });
-      }
-    }
-    return found;
-  };
-
   /* AI Detection — create boxes from PDF structure */
-  const runDetection=()=>{
-    setDetecting(true);setScanPct(0);
-    const iv=setInterval(()=>{setScanPct(p=>{if(p>=100){clearInterval(iv);
-      // Generate detected questions with bounding boxes on actual pages
-      const qs=[
-        {id:1,num:"1",title:"Linear Regression — X^TX",pts:1,type:"mc",answerKey:"C",page:2},
-        {id:2,num:"2",title:"X^TX Not Invertible Reasons",pts:2,type:"mc-multi",answerKey:"B, D",page:2},
-        {id:3,num:"3",title:"Making X^TX Invertible",pts:2,type:"mc-multi",answerKey:"A, B",page:2},
-        {id:4,num:"4",title:"Neural Network Variance",pts:5,type:"fill",answerKey:"Inc,Dec,Dec,Inc,Dec",page:2},
-        {id:5,num:"5",title:"MLP Parameters",pts:2,type:"mc",answerKey:"D",page:3},
-        {id:6,num:"6",title:"Backpropagation ∂L/∂W₁",pts:2,type:"mc",answerKey:"C",page:3},
-        {id:7,num:"7",title:"Optimization Algorithms",pts:2,type:"mc-multi",answerKey:"A, C",page:3},
-        {id:8,num:"8",title:"Logistic Regression",pts:2,type:"mc-multi",answerKey:"C",page:4},
-        {id:9,num:"9",title:"Gini Impurity",pts:2,type:"mc-multi",answerKey:"C",page:4},
-        {id:10,num:"10",title:"kNN Algorithm",pts:2,type:"mc-multi",answerKey:"B",page:4},
-        {id:11,num:"11",title:"kNN k-trend",pts:2,type:"fill",answerKey:"B, C",page:4},
-        {id:12,num:"12",title:"XOR with MLP",pts:7,type:"free",answerKey:"See key",page:5},
-        {id:13,num:"13",title:"3-class Softmax",pts:7,type:"free",answerKey:"See key",page:6},
-        {id:14,num:"14",title:"kNN Classifier",pts:6,type:"free",answerKey:"See key",page:7},
-        {id:15,num:"15",title:"Decision Tree",pts:6,type:"free",answerKey:"See key",page:8},
-      ];
-      // Detect questions (metadata only — no bounding boxes yet)
-      // Boxes will be drawn by teacher on the actual PDF, or auto-assigned as full-page regions
-      setBoxes([]);setQuestions(qs);setDetecting(false);setDetected(true);setPageNum(1);
-      return 100;}return p+3;})},50);
+  const runDetection = async () => {
+    setDetecting(true); setScanPct(0);
+    try {
+      // Step 1: extract text from every page with PDF.js
+      const ab = await examFileObj.arrayBuffer();
+      const doc = await pdfjsLib.getDocument({ data: ab }).promise;
+      const total = doc.numPages;
+      let fullText = "";
+      const ptMap = {};
+      for (let i = 1; i <= total; i++) {
+        const page = await doc.getPage(i);
+        const content = await page.getTextContent();
+        const pageStr = content.items.map(it => it.str).join(" ");
+        ptMap[i] = pageStr;
+        fullText += `\n\n--- PAGE ${i} ---\n${pageStr}`;
+        setScanPct(Math.round((i / total) * 50));
+      }
+      setPageTexts(ptMap);
+
+      // Step 2: send to Claude for question extraction
+      setScanPct(60);
+      const prompt = `You are analyzing an exam PDF. Here is the extracted text:\n${fullText}\n\nExtract ALL questions. Return ONLY a JSON array:\n[\n  {\n    "id": 1,\n    "num": "1",\n    "title": "short topic (max 8 words)",\n    "pts": 2,\n    "type": "mc",\n    "answerKey": "A",\n    "page": 1\n  }\n]\ntype must be one of: mc, mc-multi, fill, free.\nIf a value is unknown use: pts=1, type="free", answerKey="See key".`;
+
+      const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
+        method: "POST",
+        headers: OPENAI_HEADERS,
+        body: JSON.stringify({
+          model:"glm-4.5",
+          max_tokens: 16384,
+          messages: [{ role: "user", content: prompt }]
+        })
+      });
+      setScanPct(90);
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+      const raw = (data.choices?.[0]?.message?.content || "").trim();
+      // Extract JSON array robustly — find first [ ... last ]
+      const start = raw.indexOf("["), end = raw.lastIndexOf("]");
+      console.log("=== MODEL RAW RESPONSE ===");
+      console.log(raw);
+      console.log("=== FULL DATA ===");
+      console.log(data);
+      if (start === -1 || end === -1) throw new Error("No JSON array in response:\n" + raw.slice(0, 500));
+      const parsedQs = JSON.parse(raw.slice(start, end + 1)).map((q, i) => ({ ...q, id: i + 1, pts: Math.max(1, Number(q.pts) || 1) }));
+
+      setScanPct(100);
+      setBoxes([]); setQuestions(parsedQs); setDetected(true); setPageNum(1); setPdfTotalPages(total);
+    } catch(err) {
+      console.error("Detection failed:", err);
+      alert("Detection failed: " + err.message);
+    } finally {
+      setDetecting(false);
+    }
   };
 
   // Auto-assign: one box per question covering the full page area
@@ -381,41 +1442,6 @@ function CreateExam({course,onBack}){
     setBoxes(newBoxes);
   };
 
-  // AI Auto-Detect: generate boxes positioned across the page for each question
-  const autoDetectBoxes=async()=>{
-    setIsDetectingBoxes(true);
-    if(questions.length===0){setIsDetectingBoxes(false);return;}
-    // First try text-based detection with PDF.js
-    try{
-      const pages = await extractTextPositions(examFileObj);
-      const textBoxes = detectBoxesFromText(pages, questions);
-      if(textBoxes && textBoxes.length>0){
-        setBoxes(prev=>{
-          const filtered = prev.filter(b=>!textBoxes.some(tb=>tb.id===b.id));
-          return [...filtered,...textBoxes];
-        });
-        setIsDetectingBoxes(false);
-        return;
-      }
-    }catch(err){console.warn('text detect failed',err);}    
-    // Fallback: distribute boxes evenly per page
-    setTimeout(()=>{
-      const byPage = questions.reduce((m,q)=>{ const p = q.page||pageNum; (m[p] = m[p]||[]).push(q); return m; }, {});
-      const newBoxes = [];
-      Object.keys(byPage).forEach(pg => {
-        const qs = byPage[pg];
-        const sectionHeight = 100 / qs.length;
-        const margin = Math.min(6, sectionHeight * 0.15);
-        qs.forEach((q, idx) => {
-          const y = idx * sectionHeight + margin;
-          const h = Math.max(12, sectionHeight - margin * 1.25);
-          newBoxes.push({ id: q.id, label: `Q${q.num}`, x:5, y, w:90, h, page: Number(pg), type: "answer", pts: q.pts, qtype: q.type });
-        });
-      });
-      setBoxes(prev=>{const filtered=prev.filter(b=>!newBoxes.some(nb=>nb.id===b.id));return[...filtered,...newBoxes];});
-      setIsDetectingBoxes(false);
-    },600);
-  };
 
   /* Normalize rubric points */
   const normalizeRubric=(items,target)=>{
@@ -433,13 +1459,15 @@ function CreateExam({course,onBack}){
     for(const q of questions){
       setGenProgress(p=>[...p,{qId:q.id,status:"gen"}]);
       try{
-        const prompt=q.type==="mc"?`Rubric for MC Q${q.num} "${q.title}" (${q.pts}pt). Answer:${q.answerKey}. Return JSON: [{"title":"...","pts":${q.pts}}]`
-          :q.type==="mc-multi"?`Rubric for multi-select Q${q.num} "${q.title}" (${q.pts}pts). Answers:${q.answerKey}. Per-option scoring. Points sum to ${q.pts}. JSON array only: [{"title":"...","pts":n}]`
-          :q.type==="fill"?`Rubric for fill-in Q${q.num} "${q.title}" (${q.pts}pts). Answers:${q.answerKey}. Per-blank scoring. Sum=${q.pts}. JSON array: [{"title":"...","pts":n}]`
-          :`Detailed rubric for free-response Q${q.num} "${q.title}" (${q.pts}pts). Break by sub-parts with specific scoring. Sum EXACTLY ${q.pts}. JSON array: [{"title":"...","pts":n}]`;
-        const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:600,messages:[{role:"user",content:prompt}]})});
-        const d=await r.json();const txt=(d.content||[]).map(c=>c.text||"").join("").replace(/```json|```/g,"").trim();
-        const parsed=JSON.parse(txt).map((c,i)=>({...c,id:i+1,pts:Math.max(0,Number(c.pts)||0)}));
+        const ctx=pageTexts[q.page]?`\nPage ${q.page} text:\n${pageTexts[q.page].slice(0,800)}\n`:"";
+        const prompt=q.type==="mc"?`Rubric for MC Q${q.num} "${q.title}" (${q.pts}pt). Answer:${q.answerKey}.${ctx}Return JSON: [{"title":"...","pts":${q.pts}}]`
+          :q.type==="mc-multi"?`Rubric for multi-select Q${q.num} "${q.title}" (${q.pts}pts). Answers:${q.answerKey}.${ctx}Per-option scoring. Points sum to ${q.pts}. JSON array only: [{"title":"...","pts":n}]`
+          :q.type==="fill"?`Rubric for fill-in Q${q.num} "${q.title}" (${q.pts}pts). Answers:${q.answerKey}.${ctx}Per-blank scoring. Sum=${q.pts}. JSON array: [{"title":"...","pts":n}]`
+          :`Detailed rubric for free-response Q${q.num} "${q.title}" (${q.pts}pts).${ctx}Break by sub-parts with specific scoring. Sum EXACTLY ${q.pts}. JSON array: [{"title":"...","pts":n}]`;
+        const r=await fetch(`${OPENAI_BASE}/chat/completions`,{method:"POST",headers:OPENAI_HEADERS,body:JSON.stringify({model:"OpenAI/gpt-4o",max_tokens:600,messages:[{role:"user",content:prompt}]})});
+        const d=await r.json();const txt=(d.choices?.[0]?.message?.content||"").replace(/```json|```/g,"").trim();
+        const si=txt.indexOf("["),ei=txt.lastIndexOf("]");
+        const parsed=JSON.parse(si>-1?txt.slice(si,ei+1):txt).map((c,i)=>({...c,id:i+1,pts:Math.max(0,Number(c.pts)||0)}));
         results[q.id]=normalizeRubric(parsed,q.pts);
         setGenProgress(p=>p.map(x=>x.qId===q.id?{...x,status:"done"}:x));
       }catch{
@@ -462,8 +1490,8 @@ function CreateExam({course,onBack}){
         const q=questions[qi];const rub=rubrics[q.id]||[];
         try{
           const prompt=`Grade student "${sf.name}" on Q${q.num} "${q.title}" (${q.pts}pts, ${q.type}). Answer:${q.answerKey}. Rubric:\n${rub.map((c,i)=>`${i+1}."${c.title}"(${c.pts}pts)`).join("\n")}\nSimulate realistic grad student. Return JSON only:\n{"criteria":[{"earned":n,"reason":"why"}],"studentAnswer":"what they wrote","overallFeedback":"comment","confidence":0.8}`;
-          const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:600,messages:[{role:"user",content:prompt}]})});
-          const d=await r.json();const txt=(d.content||[]).map(c=>c.text||"").join("").replace(/```json|```/g,"").trim();
+          const r=await fetch(`${OPENAI_BASE}/chat/completions`,{method:"POST",headers:OPENAI_HEADERS,body:JSON.stringify({model:"OpenAI/gpt-4o",max_tokens:600,messages:[{role:"user",content:prompt}]})});
+          const d=await r.json();const txt=(d.choices?.[0]?.message?.content||"").replace(/```json|```/g,"").trim();
           const p=JSON.parse(txt);
           const crit=(p.criteria||[]).map((c,i)=>({earned:Math.min(Math.max(0,c.earned||0),rub[i]?.pts||0),reason:c.reason||"",maxPts:rub[i]?.pts||0,title:rub[i]?.title||""}));
           grades.push({qId:q.id,qNum:q.num,criteria:crit,total:crit.reduce((a,c)=>a+c.earned,0),maxPts:q.pts,studentAnswer:p.studentAnswer||"",feedback:p.overallFeedback||"",confidence:Math.min(1,Math.max(0,p.confidence||0.8))});
@@ -520,39 +1548,27 @@ function CreateExam({course,onBack}){
             <button onClick={()=>setTool("draw")} style={{..._b(tool==="draw"?"green":"outline"),padding:"5px 12px",fontSize:12}}><Square size={13}/>Draw Box</button>
           </div>
           <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-            <button onClick={autoDetectBoxes} disabled={isDetectingBoxes||questions.length===0} style={{..._b(isDetectingBoxes?"outline":"blue"),padding:"5px 12px",fontSize:12,opacity:isDetectingBoxes||questions.length===0?0.4:1,cursor:isDetectingBoxes||questions.length===0?"not-allowed":"pointer"}}><Sparkles size={13}/>AI Auto-Detect</button>
             {boxes.length===0&&<button onClick={autoAssignBoxes} style={{..._b("outline"),padding:"5px 12px",fontSize:12,color:T.primary,borderColor:T.primary+"50"}}><Sparkles size={13}/>Full Page</button>}
             {boxes.length>0&&<button onClick={()=>setBoxes([])} style={{..._b("ghost"),padding:"5px 12px",fontSize:12,color:T.red}}><Trash2 size={12}/>Clear All</button>}
           </div>
         </div>
-        {/* PDF Viewer with optional scan overlay */}
-        <div style={{position:"relative"}}>
-          <PdfViewer file={examFileObj} boxes={boxes} activeBox={activeBox} onSelectBox={id=>{setActiveBox(id);const b=boxes.find(x=>x.id===id);if(b)setPageNum(b.page);}} tool={tool} pageNum={pageNum} onPageChange={setPageNum} totalPages={10}
-            pdfInteractive={!resizing}
-            onUpdateBox={(action,data)=>{if(action==="add"){const newId=Math.max(0,...boxes.map(b=>b.id),0)+1;setBoxes(b=>[...b,{...data,id:newId,label:`Q${newId}`,type:"answer",pts:0,qtype:"manual"}]);}}}/>
-          {/* AI Scanning overlay */}
-          {isDetectingBoxes&&<div style={{position:"absolute",top:0,left:0,right:0,bottom:0,background:"linear-gradient(90deg,transparent,rgba(67,85,219,0.15),transparent)",backgroundPosition:"200% center",backgroundSize:"200% 100%",borderRadius:T.rs,animation:"scanningGradient 2s ease-in-out infinite",pointerEvents:"none",border:`2px solid ${T.primary}`}}>
-            <div style={{position:"absolute",top:0,left:0,right:0,padding:"12px 16px",background:`${T.primary}10`,display:"flex",alignItems:"center",gap:8,borderRadius:`${T.rs} ${T.rs} 0 0`,borderBottom:`1px solid ${T.primary}30`}}>
-              <Sparkles size={16} color={T.primary} style={{animation:"pulse 1.5s infinite"}}/><span style={{fontSize:12,fontWeight:700,color:T.primary}}>AI scanning... generating answer boxes</span>
-            </div>
-          </div>}
-        </div>
-        {tool==="draw"&&<p style={{margin:"8px 0 0",fontSize:12,color:T.green,fontWeight:600,textAlign:"center"}}>Click and drag on the PDF to draw a bounding box</p>}
-        {isDetectingBoxes&&<p style={{margin:"8px 0 0",fontSize:12,color:T.primary,fontWeight:600,textAlign:"center"}}>AI is analyzing the document...</p>}
+        <PdfViewer file={examFileObj} boxes={boxes} activeBox={activeBox} onSelectBox={id=>{setActiveBox(id);const b=boxes.find(x=>x.id===id);if(b)setPageNum(b.page);}} tool={tool} pageNum={pageNum} onPageChange={setPageNum} totalPages={pdfTotalPages}
+            onLoad={n=>setPdfTotalPages(n)}
+            onUpdateBox={(action,data)=>{if(action==="add"){const newId=Math.max(0,...boxes.map(b=>b.id),0)+1;setPendingBox({...data,id:newId});}}}/>
+        {tool==="draw"&&<p style={{margin:"8px 0 0",fontSize:12,color:T.green,fontWeight:600,textAlign:"center"}}>Click and drag on the PDF to draw a bounding box · scroll to navigate</p>}
       </div>
       {/* Splitter: draggable handle to resize right panel */}
       <div
         onMouseDown={(e)=>{
           const startX = e.clientX;
           const startWidth = rightPanelWidthRef.current || 300;
-          setResizing(true);
           const onMove = (ev)=>{
-            const dx = startX - ev.clientX; // dragging left increases right width
+            const dx = startX - ev.clientX;
             const nw = Math.max(180, Math.min(700, startWidth + dx));
             setRightWidth(nw);
             rightPanelWidthRef.current = nw;
           };
-          const onUp = ()=>{setResizing(false);window.removeEventListener('mousemove',onMove);window.removeEventListener('mouseup',onUp);} ;
+          const onUp = ()=>{window.removeEventListener('mousemove',onMove);window.removeEventListener('mouseup',onUp);} ;
           window.addEventListener('mousemove',onMove);window.addEventListener('mouseup',onUp);
         }}
         style={{width:10,cursor:"col-resize",background:"transparent",display:"flex",alignItems:"center",justifyContent:"center"}}
@@ -566,7 +1582,7 @@ function CreateExam({course,onBack}){
         </div>
         <div style={{fontSize:11,color:T.textSec,marginBottom:12,lineHeight:1.4}}>
           AI detected {questions.length} questions.
-          {boxes.length===0&&<span style={{color:T.orange,fontWeight:600}}> Use draw tool, AI Auto-Detect, or Full Page to mark regions.</span>}
+          {boxes.length===0&&<span style={{color:T.orange,fontWeight:600}}> Use the Draw Box tool or Full Page to mark regions.</span>}
         </div>
         {questions.map(q=>{
           const qBox=boxes.find(b=>b.id===q.id);
@@ -597,7 +1613,7 @@ function CreateExam({course,onBack}){
       </div>
     </div>}
     <NavB ok={detected}/>
-    <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}@keyframes scanningGradient{0%{backgroundPosition:200% center}50%{backgroundPosition:-200% center}100%{backgroundPosition:200% center}}`}</style>
+    <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
   </div>);
 
   /* ── Step 2: Review & Rubric ── */
@@ -708,30 +1724,95 @@ function CreateExam({course,onBack}){
     <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
   </div>);
 
-  /* ── Step 5: Final results summary ── */
+  /* ── Step 5: Final results summary with AI Insights dashboard ── */
   const S5=()=>{if(!gradingResults)return null;const examTotal=questions.reduce((s,q)=>s+q.pts,0);
-    return(<div><div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:32,boxShadow:T.sh}}>
-      <div style={{textAlign:"center",marginBottom:24}}><div style={{width:56,height:56,borderRadius:"50%",background:T.greenLight,display:"inline-flex",alignItems:"center",justifyContent:"center",marginBottom:14}}><CheckCircle2 size={28} color={T.green}/></div><h2 style={{fontSize:22,fontWeight:900,margin:"0 0 6px"}}>Grading Complete!</h2><p style={{color:T.textSec,fontSize:14,margin:0}}>{gradingResults.length} submissions graded · {examTotal} points total</p></div>
-      <div style={{borderRadius:T.rs,border:`1px solid ${T.border}`,overflow:"hidden"}}>
-        <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-          <thead><tr style={{background:"#F8F9FC"}}><th style={{padding:"10px 14px",textAlign:"left",fontWeight:700,fontSize:11,color:T.textSec,borderBottom:`1px solid ${T.border}`}}>STUDENT</th>{questions.map(q=><th key={q.id} style={{padding:"10px 4px",textAlign:"center",fontWeight:700,fontSize:10,color:T.textSec,borderBottom:`1px solid ${T.border}`}}>Q{q.num}<br/>/{q.pts}</th>)}<th style={{padding:"10px 14px",textAlign:"center",fontWeight:700,fontSize:11,color:T.textSec,borderBottom:`1px solid ${T.border}`}}>TOTAL</th></tr></thead>
-          <tbody>{gradingResults.map((r,ri)=><tr key={ri} style={{borderBottom:ri<gradingResults.length-1?`1px solid ${T.border}`:"none"}}><td style={{padding:"10px 14px",fontWeight:600,fontSize:12}}>{r.file.name}</td>{r.grades.map((g,gi)=>{const p=g.maxPts>0?g.total/g.maxPts:0;return<td key={gi} style={{padding:"10px 4px",textAlign:"center",fontWeight:700,fontSize:12,color:p>=0.8?T.green:p>=0.5?T.text:T.red}}>{g.total}</td>})}<td style={{padding:"10px 14px",textAlign:"center",fontWeight:800,fontSize:14,color:T.primary}}>{r.totalScore}/{r.maxScore}</td></tr>)}</tbody>
-        </table>
+    return(<div>
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"28px 32px",boxShadow:T.sh,marginBottom:18}}>
+        <div style={{textAlign:"center",marginBottom:20}}>
+          <div style={{width:56,height:56,borderRadius:"50%",background:T.greenLight,display:"inline-flex",alignItems:"center",justifyContent:"center",marginBottom:14}}><CheckCircle2 size={28} color={T.green}/></div>
+          <h2 style={{fontSize:22,fontWeight:900,margin:"0 0 6px"}}>Grading Complete!</h2>
+          <p style={{color:T.textSec,fontSize:14,margin:0}}>{gradingResults.length} submissions graded · {examTotal} points total</p>
+        </div>
+        <ExamInsights gradingResults={gradingResults} questions={questions}/>
       </div>
-    </div><NavB/></div>);};
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"20px 22px",boxShadow:T.sh}}>
+        <h3 style={{fontSize:16,fontWeight:800,margin:"0 0 14px",display:"flex",alignItems:"center",gap:8}}><ClipboardList size={16} color={T.primary}/>Student Results</h3>
+        <div style={{borderRadius:T.rs,border:`1px solid ${T.border}`,overflow:"hidden"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <thead><tr style={{background:"#F8F9FC"}}><th style={{padding:"10px 14px",textAlign:"left",fontWeight:700,fontSize:11,color:T.textSec,borderBottom:`1px solid ${T.border}`}}>STUDENT</th>{questions.map(q=><th key={q.id} style={{padding:"10px 4px",textAlign:"center",fontWeight:700,fontSize:10,color:T.textSec,borderBottom:`1px solid ${T.border}`}}>Q{q.num}<br/>/{q.pts}</th>)}<th style={{padding:"10px 14px",textAlign:"center",fontWeight:700,fontSize:11,color:T.textSec,borderBottom:`1px solid ${T.border}`}}>TOTAL</th></tr></thead>
+            <tbody>{gradingResults.map((r,ri)=><tr key={ri} style={{borderBottom:ri<gradingResults.length-1?`1px solid ${T.border}`:"none"}}><td style={{padding:"10px 14px",fontWeight:600,fontSize:12}}>{r.file.name}</td>{r.grades.map((g,gi)=>{const p=g.maxPts>0?g.total/g.maxPts:0;return<td key={gi} style={{padding:"10px 4px",textAlign:"center",fontWeight:700,fontSize:12,color:p>=0.8?T.green:p>=0.5?T.text:T.red}}>{g.total}</td>})}<td style={{padding:"10px 14px",textAlign:"center",fontWeight:800,fontSize:14,color:T.primary}}>{r.totalScore}/{r.maxScore}</td></tr>)}</tbody>
+          </table>
+        </div>
+      </div>
+      <NavB/>
+    </div>);};
 
   const steps=[S0,S1,S2,S3,S4,S5];const SC=steps[step];
-  return(<div style={_ctr}><div onClick={onBack} style={{display:"inline-flex",alignItems:"center",gap:5,color:T.textSec,cursor:"pointer",marginBottom:16,fontSize:13,fontWeight:500}}><ChevronLeft size={16}/>Back to {course.code}</div><div style={{marginBottom:6}}><h1 style={{fontSize:24,fontWeight:900,margin:"0 0 3px"}}>Create New Exam</h1><p style={{color:T.textSec,margin:"0 0 20px",fontSize:14}}>AI-assisted exam setup and grading</p></div><StepBar/><SC/></div>);
+  return(<div style={_ctr}>
+    {pendingBox && (
+      <BoxDialog
+        box={pendingBox}
+        questions={questions}
+        onConfirm={(overrides) => {
+          setBoxes(b => [...b, { ...pendingBox, ...overrides }]);
+          setPendingBox(null);
+        }}
+        onCancel={() => setPendingBox(null)}
+      />
+    )}
+    <div onClick={onBack} style={{display:"inline-flex",alignItems:"center",gap:5,color:T.textSec,cursor:"pointer",marginBottom:16,fontSize:13,fontWeight:500}}><ChevronLeft size={16}/>Back to {course.code}</div><div style={{marginBottom:6}}><h1 style={{fontSize:24,fontWeight:900,margin:"0 0 3px"}}>Create New Exam</h1><p style={{color:T.textSec,margin:"0 0 20px",fontSize:14}}>AI-assisted exam setup and grading</p></div><StepBar/><SC/>
+  </div>);
 }
 
 /* ═══ Course ═══ */
-function Course({course,onBack,onExam}){
-  return(<div style={_ctr}><div onClick={onBack} style={{display:"inline-flex",alignItems:"center",gap:5,color:T.textSec,cursor:"pointer",marginBottom:16,fontSize:13,fontWeight:500}}><ChevronLeft size={16}/>Back to Courses</div>
-    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:24}}><div style={{display:"flex",alignItems:"center",gap:14}}><div style={{width:52,height:52,borderRadius:14,background:course.color}}/><div><h1 style={{fontSize:26,fontWeight:900,margin:"0 0 2px"}}>{course.code}</h1><p style={{margin:0,color:T.textSec,fontSize:14}}>{course.name}</p></div></div></div>
-    <h2 style={{fontSize:18,fontWeight:800,margin:"0 0 16px"}}>Assignments</h2>
-    <div style={{display:"flex",gap:12,marginBottom:20}}><button style={_b("primary")}><Plus size={14}/>Create Assignment</button><button onClick={onExam} style={_b("outline")}><Plus size={14}/>Create Exam</button></div>
-    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:16}}>
-      {[{t:"Midterm Exam II",ty:"exam",pts:50,due:"3/4/2026"},{t:"Homework 5",ty:"homework",pts:30,due:"4/1/2026"}].map((a,i)=><div key={i} style={{..._card,cursor:"default"}}><h3 style={{margin:"0 0 8px",fontSize:16,fontWeight:700}}>{a.t}</h3><div style={{display:"flex",gap:8,fontSize:12,color:T.textSec}}><span>{a.ty}</span><span>{a.pts} pts</span><span>Due: {a.due}</span></div></div>)}
+function Course({course,onBack,onExam,onAssignment}){
+  const assignments=getAssignments(course.id);
+  return(<div style={_ctr}>
+    <div onClick={onBack} style={{display:"inline-flex",alignItems:"center",gap:5,color:T.textSec,cursor:"pointer",marginBottom:16,fontSize:13,fontWeight:500}}><ChevronLeft size={16}/>Back to Courses</div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:24}}>
+      <div style={{display:"flex",alignItems:"center",gap:14}}>
+        <div style={{width:52,height:52,borderRadius:14,background:course.color}}/>
+        <div><h1 style={{fontSize:26,fontWeight:900,margin:"0 0 2px"}}>{course.code}</h1><p style={{margin:0,color:T.textSec,fontSize:14}}>{course.name}</p></div>
+      </div>
+    </div>
+    <h2 style={{fontSize:20,fontWeight:900,margin:"0 0 16px"}}>Assignments</h2>
+    <div style={{display:"flex",gap:12,marginBottom:20}}>
+      <button style={_b("primary")}><Plus size={14}/>Create Assignment</button>
+      <button onClick={onExam} style={_b("outline")}><Plus size={14}/>Create Exam</button>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(360px,1fr))",gap:18}}>
+      {assignments.map(a=>{
+        const subCount=a.submissions.length;
+        const gradedCount=a.submissions.filter(s=>s.grades).length;
+        const progress=subCount>0?gradedCount/subCount:0;
+        const isExam=a.type==="exam";
+        return(<div key={a.id} onClick={()=>onAssignment(a)} style={{..._card,cursor:"pointer"}}
+          onMouseEnter={e=>{e.currentTarget.style.boxShadow=T.shM;e.currentTarget.style.transform="translateY(-2px)";}}
+          onMouseLeave={e=>{e.currentTarget.style.boxShadow="none";e.currentTarget.style.transform="translateY(0)";}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+            <div style={{flex:1,minWidth:0,marginRight:12}}>
+              <h3 style={{margin:"0 0 10px",fontSize:18,fontWeight:800,lineHeight:1.25}}>{a.title}</h3>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                <span style={{padding:"4px 14px",borderRadius:T.rr,fontSize:11,fontWeight:700,background:isExam?"#FEE8E8":T.primaryLight,color:isExam?T.red:T.primary}}>{a.type}</span>
+                {a.published&&<span style={{padding:"4px 14px",borderRadius:T.rr,fontSize:11,fontWeight:700,background:T.text,color:"#fff"}}>published</span>}
+              </div>
+            </div>
+            <div style={{textAlign:"right",flexShrink:0}}>
+              <div style={{fontSize:32,fontWeight:900,lineHeight:1}}>{a.pts}</div>
+              <div style={{fontSize:12,color:T.textSec,marginTop:2}}>points</div>
+            </div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:10,marginTop:4}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:T.red,fontWeight:600}}><Calendar size={14}/>Due: {a.due}</div>
+            <div style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:T.textSec}}><FileText size={14}/>{subCount} submissions</div>
+            <div style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:T.textSec}}>
+              <CheckCircle2 size={14}/>Grading Progress
+              <span style={{marginLeft:"auto",fontWeight:700,color:T.text}}>{gradedCount}/{subCount}</span>
+            </div>
+            <div style={{height:8,borderRadius:T.rr,background:`linear-gradient(90deg,#F2F3FA 0%,#F6F3FF 100%)`,overflow:"hidden",border:`1px solid ${T.primary}10`}}><div style={{height:"100%",width:`${progress*100}%`,background:`linear-gradient(90deg,${T.primary} 0%,${T.purple} 100%)`,borderRadius:T.rr,transition:"width 0.3s",boxShadow:"0 0 12px rgba(67,85,219,0.26)"}}/></div>
+          </div>
+        </div>);
+      })}
     </div>
   </div>);
 }
@@ -753,11 +1834,22 @@ function Help({onBack}){
 
 /* ═══ App ═══ */
 export default function App(){
-  const[page,setPage]=useState("login");const[role,setRole]=useState("instructor");const[course,setCourse]=useState(null);
+  const[page,setPage]=useState("login");
+  const[role,setRole]=useState("instructor");
+  const[course,setCourse]=useState(null);
+  const[assignment,setAssignment]=useState(null);
   if(page==="login")return<><FL/><Login onLogin={r=>{setRole(r);setPage("dashboard")}}/></>;
-  return(<div style={{minHeight:"100vh",background:T.bg,fontFamily:T.font,color:T.text}}><FL/><Nav onNav={p=>{setPage(p);setCourse(null);}} role={role} onLogout={()=>{setPage("login");setCourse(null);}}/>
+  const resetNav=p=>{setPage(p);setCourse(null);setAssignment(null);};
+  if(role==="student")return(<div style={{minHeight:"100vh",background:T.bg,fontFamily:T.font,color:T.text}}><FL/><Nav onNav={resetNav} role={role} onLogout={()=>{resetNav("login");}}/>
+    {page==="dashboard"&&<StudentDashboard onSelect={c=>{setCourse(c);setPage("course")}}/>}
+    {page==="course"&&course&&<StudentCourse course={course} onBack={()=>{setCourse(null);setPage("dashboard")}} onAssignment={a=>{setAssignment(a);setPage("assignment")}}/>}
+    {page==="assignment"&&course&&assignment&&<StudentAssignmentDetail assignment={assignment} course={course} onBack={()=>{setAssignment(null);setPage("course")}}/>}
+    {page==="help"&&<Help onBack={()=>setPage("dashboard")}/>}
+  </div>);
+  return(<div style={{minHeight:"100vh",background:T.bg,fontFamily:T.font,color:T.text}}><FL/><Nav onNav={resetNav} role={role} onLogout={()=>{resetNav("login");}}/>
     {page==="dashboard"&&<Dash onSelect={c=>{setCourse(c);setPage("course")}}/>}
-    {page==="course"&&course&&<Course course={course} onBack={()=>{setCourse(null);setPage("dashboard")}} onExam={()=>setPage("exam")}/>}
+    {page==="course"&&course&&<Course course={course} onBack={()=>{setCourse(null);setPage("dashboard")}} onExam={()=>setPage("exam")} onAssignment={a=>{setAssignment(a);setPage("assignment")}}/>}
+    {page==="assignment"&&course&&assignment&&<AssignmentView assignment={assignment} course={course} onBack={()=>{setAssignment(null);setPage("course")}}/>}
     {page==="exam"&&course&&<CreateExam course={course} onBack={()=>setPage("course")}/>}
     {page==="help"&&<Help onBack={()=>setPage("dashboard")}/>}
   </div>);
