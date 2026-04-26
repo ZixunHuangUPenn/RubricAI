@@ -81,7 +81,7 @@ function Dash({onSelect}){return(<div style={_ctr}><div style={{display:"flex",j
    PDF VIEWER — uses browser's native PDF renderer + overlay boxes
    No external libraries needed. Uses <object> with blob URL.
    ═══════════════════════════════════════════════════════════ */
-function PdfViewer({file, boxes, activeBox, onSelectBox, onUpdateBox, tool, pageNum, onPageChange, totalPages, onLoad}){
+function PdfViewer({file, boxes, activeBox, onSelectBox, onUpdateBox, onDeleteBox, tool, pageNum, onPageChange, totalPages, onLoad}){
   const containerRef = useRef(null);
   const canvasRef   = useRef(null);
   const overlayRef  = useRef(null);
@@ -89,6 +89,7 @@ function PdfViewer({file, boxes, activeBox, onSelectBox, onUpdateBox, tool, page
   const pdfDocRef   = useRef(null);
   const renderTaskRef = useRef(null);
   const [drawing, setDrawing] = useState(null);
+  const [resizing, setResizing] = useState(null);
   const containerH = 620;
 
   // Render one page onto the canvas, scaled to fill the container width exactly
@@ -166,6 +167,47 @@ function PdfViewer({file, boxes, activeBox, onSelectBox, onUpdateBox, tool, page
     if (containerRef.current) containerRef.current.scrollTop += e.deltaY;
   };
 
+  // --- Resize handlers (edges/corners of selected box) ---
+  const startResize = (e, box, handle) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const r = overlayRef.current?.getBoundingClientRect();
+    if (!r) return;
+    setResizing({
+      id: box.id, handle,
+      x: box.x, y: box.y, w: box.w, h: box.h,
+      mx: e.clientX, my: e.clientY,
+      rw: r.width, rh: r.height,
+    });
+  };
+
+  useEffect(() => {
+    if (!resizing) return;
+    const onMove = (e) => {
+      const dx = ((e.clientX - resizing.mx) / resizing.rw) * 100;
+      const dy = ((e.clientY - resizing.my) / resizing.rh) * 100;
+      let x = resizing.x, y = resizing.y, w = resizing.w, h = resizing.h;
+      if (resizing.handle.includes("e")) w = resizing.w + dx;
+      if (resizing.handle.includes("w")) { x = resizing.x + dx; w = resizing.w - dx; }
+      if (resizing.handle.includes("s")) h = resizing.h + dy;
+      if (resizing.handle.includes("n")) { y = resizing.y + dy; h = resizing.h - dy; }
+      if (w < 1) w = 1;
+      if (h < 1) h = 1;
+      if (x < 0) { w += x; x = 0; }
+      if (y < 0) { h += y; y = 0; }
+      if (x + w > 100) w = 100 - x;
+      if (y + h > 100) h = 100 - y;
+      if (onUpdateBox) onUpdateBox("resize", { id: resizing.id, x, y, w, h });
+    };
+    const onUp = () => setResizing(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [resizing, onUpdateBox]);
+
   const pageBoxes = (boxes || []).filter(b => b.page === pageNum);
   const pc = totalPages || 1;
 
@@ -193,23 +235,55 @@ function PdfViewer({file, boxes, activeBox, onSelectBox, onUpdateBox, tool, page
                 {pageBoxes.map(b => {
                   const isActive = activeBox === b.id;
                   const color = b.type === "question" ? T.primary : T.green;
+                  const handles = [
+                    ["nw","top-left","nwse-resize",-5,-5],["n","top","ns-resize","50%",-5],["ne","top-right","nesw-resize","100%",-5],
+                    ["e","right","ew-resize","100%","50%"],["se","bottom-right","nwse-resize","100%","100%"],
+                    ["s","bottom","ns-resize","50%","100%"],["sw","bottom-left","nesw-resize",-5,"100%"],
+                    ["w","left","ew-resize",-5,"50%"],
+                  ];
                   return (
-                    <div key={b.id} onClick={(e) => { e.stopPropagation(); onSelectBox && onSelectBox(b.id); }}
+                    <div key={b.id} onMouseDown={(e) => { e.stopPropagation(); onSelectBox && onSelectBox(b.id); }}
                       style={{
                         position: "absolute", left: `${b.x}%`, top: `${b.y}%`, width: `${b.w}%`, height: `${b.h}%`,
                         border: `2.5px solid ${isActive ? color : color + "90"}`, borderRadius: 6,
                         background: `${color}${isActive ? "18" : "08"}`, cursor: "pointer",
-                        boxShadow: isActive ? `0 0 0 3px ${color}30` : "none", transition: "all 0.2s",
+                        boxShadow: isActive ? `0 0 0 3px ${color}30` : "none",
                         pointerEvents: "auto",
                       }}>
                       <div style={{ position: "absolute", top: -12, left: 6, background: T.card, padding: "1px 8px", fontSize: 10, fontWeight: 800, color, borderRadius: 3, boxShadow: "0 1px 3px rgba(0,0,0,0.15)" }}>
                         {b.label}
                       </div>
+                      {/* Delete button (red X) */}
+                      {isActive && onDeleteBox && (
+                        <button
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); onDeleteBox(b.id); }}
+                          title="Delete box (Del)"
+                          style={{
+                            position: "absolute", top: -10, right: -10, width: 20, height: 20,
+                            borderRadius: "50%", background: T.red, color: "#fff", border: "2px solid #fff",
+                            cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                            padding: 0, boxShadow: "0 2px 6px rgba(0,0,0,0.25)", zIndex: 2,
+                          }}>
+                          <X size={11} />
+                        </button>
+                      )}
                       {isActive && (
                         <div style={{ position: "absolute", bottom: -12, right: 6, background: T.card, padding: "1px 8px", fontSize: 10, fontWeight: 700, color: T.textSec, borderRadius: 3, boxShadow: "0 1px 3px rgba(0,0,0,0.15)" }}>
                           {b.pts} pts · {b.qtype}
                         </div>
                       )}
+                      {/* Resize handles */}
+                      {isActive && handles.map(([key,_name,cursor,hx,hy]) => (
+                        <div key={key}
+                          onMouseDown={(e) => startResize(e, b, key)}
+                          style={{
+                            position: "absolute", width: 10, height: 10, background: "#fff",
+                            border: `2px solid ${color}`, borderRadius: 2, cursor,
+                            left: typeof hx === "string" ? hx : hx, top: typeof hy === "string" ? hy : hy,
+                            transform: "translate(-50%, -50%)", zIndex: 1,
+                          }} />
+                      ))}
                     </div>
                   );
                 })}
@@ -1333,7 +1407,7 @@ function AssignmentView({assignment,course,onBack}){
 /* ═══════════════════════════════════════════════════════════
    CREATE EXAM — Full AI Workflow with PDF Canvas
    ═══════════════════════════════════════════════════════════ */
-const STEPS=[{l:"Upload\nExam",I:Upload},{l:"AI\nDetection",I:Sparkles},{l:"Review &\nRubric",I:ClipboardList},{l:"Upload\nSubmissions",I:FileUp},{l:"AI\nGrading",I:Star},{l:"Results",I:CheckCircle2}];
+const STEPS=[{l:"Upload\nExam",I:Upload},{l:"AI\nAuto-Boxing",I:Sparkles},{l:"Review &\nRubric",I:ClipboardList},{l:"Upload\nSubmissions",I:FileUp},{l:"AI\nGrading",I:Star},{l:"Results",I:CheckCircle2}];
 
 function CreateExam({course,onBack}){
   const[step,setStep]=useState(0);
@@ -1357,6 +1431,8 @@ function CreateExam({course,onBack}){
   const[gradingProg,setGradingProg]=useState([]);
   const[expandedStudent,setExpandedStudent]=useState(0);
   const[expandedQ,setExpandedQ]=useState(null);
+  const[approvals,setApprovals]=useState({}); // "{si}-{qId}" -> "approved" | "flagged"
+  const[reviewFilter,setReviewFilter]=useState("all"); // "all" | "review" | "approved"
   const[activeRubricQ,setActiveRubricQ]=useState(0);
   const[newCrit,setNewCrit]=useState({title:"",pts:""});
   const [rightWidth, setRightWidth] = useState(300);
@@ -1369,6 +1445,27 @@ function CreateExam({course,onBack}){
   const prev=()=>setStep(s=>Math.max(s-1,0));
   const totalPts=qId=>(rubrics[qId]||[]).reduce((s,c)=>s+c.pts,0);
 
+  // Delete key shortcut — remove the selected box.
+  // Skips when the user is typing in an input/textarea so it doesn't hijack text editing.
+  useEffect(()=>{
+    const isTextInput=el=>{
+      if(!el) return false;
+      const t=(el.tagName||"").toUpperCase();
+      return t==="INPUT"||t==="TEXTAREA"||t==="SELECT"||el.isContentEditable;
+    };
+    const onKey=(e)=>{
+      if(step!==1||activeBox==null) return;
+      if(isTextInput(e.target)) return;
+      if(e.key==="Delete"||e.key==="Backspace"){
+        e.preventDefault();
+        setBoxes(b=>b.filter(x=>x.id!==activeBox));
+        setActiveBox(null);
+      }
+    };
+    window.addEventListener("keydown",onKey);
+    return ()=>window.removeEventListener("keydown",onKey);
+  },[step,activeBox]);
+
   /* File upload handler */
   const handleExamFile=(file)=>{
     if(!file||file.type!=="application/pdf"){alert("PDF only");return;}
@@ -1376,30 +1473,83 @@ function CreateExam({course,onBack}){
     setExamFile({name:file.name,size:(file.size/1024).toFixed(0)+" KB"});
   };
 
-  /* PDF text extraction using PDF.js to detect question positions */
-  /* AI Detection — create boxes from PDF structure */
-  const runDetection = async () => {
+  /* AI Auto-Boxing — send PDF text + positional layout to AI;
+     AI returns question metadata AND bounding boxes (x,y,w,h as %).
+     Frontend then renders the boxes directly on the PDF overlay. */
+  const runAutoBoxing = async () => {
     setDetecting(true); setScanPct(0);
     try {
-      // Step 1: extract text from every page with PDF.js
+      // Step 1: extract text items with positions from every page
       const ab = await examFileObj.arrayBuffer();
       const doc = await pdfjsLib.getDocument({ data: ab }).promise;
       const total = doc.numPages;
-      let fullText = "";
       const ptMap = {};
+      const pageDims = {};       // { pageNum: {w, h} } in viewport pts
+      const pageLines = {};      // { pageNum: [{yPct, text}] }
       for (let i = 1; i <= total; i++) {
         const page = await doc.getPage(i);
+        const vp = page.getViewport({ scale: 1 });
+        pageDims[i] = { w: vp.width, h: vp.height };
         const content = await page.getTextContent();
-        const pageStr = content.items.map(it => it.str).join(" ");
-        ptMap[i] = pageStr;
-        fullText += `\n\n--- PAGE ${i} ---\n${pageStr}`;
-        setScanPct(Math.round((i / total) * 50));
+        // Group items into lines by y-position (rounded)
+        const byY = new Map();
+        for (const it of content.items) {
+          if (!it.str || !it.str.trim()) continue;
+          const y = it.transform[5];      // pdf y (bottom-up)
+          const key = Math.round(y / 4) * 4;
+          const arr = byY.get(key) || [];
+          arr.push({ x: it.transform[4], str: it.str });
+          byY.set(key, arr);
+        }
+        const lines = [...byY.entries()]
+          .map(([yKey, items]) => {
+            items.sort((a, b) => a.x - b.x);
+            let text = items.map(it => it.str).join(" ").trim();
+            if (text.length > 160) text = text.slice(0, 160) + "…";
+            const yPct = +( ((vp.height - yKey) / vp.height) * 100 ).toFixed(1);
+            return { yPct, text };
+          })
+          .filter(l => l.text.length > 0)
+          .sort((a, b) => a.yPct - b.yPct);
+        pageLines[i] = lines;
+        ptMap[i] = lines.map(l => l.text).join("\n");
+        setScanPct(Math.round((i / total) * 40));
       }
       setPageTexts(ptMap);
 
-      // Step 2: send to Claude for question extraction
-      setScanPct(60);
-      const prompt = `You are analyzing an exam PDF. Here is the extracted text:\n${fullText}\n\nExtract ALL questions. Return ONLY a JSON array:\n[\n  {\n    "id": 1,\n    "num": "1",\n    "title": "short topic (max 8 words)",\n    "pts": 2,\n    "type": "mc",\n    "answerKey": "A",\n    "page": 1\n  }\n]\ntype must be one of: mc, mc-multi, fill, free.\nIf a value is unknown use: pts=1, type="free", answerKey="See key".`;
+      // Step 2: build layout prompt — AI sees text with vertical position on each page
+      setScanPct(50);
+      const layoutStr = Object.keys(pageLines).map(p => {
+        const lines = pageLines[p].map(l => `  [y=${l.yPct}%] ${l.text}`).join("\n");
+        return `--- PAGE ${p} ---\n${lines}`;
+      }).join("\n\n");
+
+      const prompt = `You are analyzing an exam PDF. Below each page's text lines are annotated with their vertical position (y% from the top of the page).
+
+${layoutStr}
+
+Identify EVERY question. For each question, return its metadata AND a bounding box covering the question PLUS the student answer region (any blank space or answer lines below the prompt, up to the next question or page bottom).
+
+Return ONLY a JSON array, no prose:
+[
+  {
+    "id": 1,
+    "num": "1",
+    "title": "short topic (max 8 words)",
+    "pts": 2,
+    "type": "mc",
+    "answerKey": "A",
+    "page": 1,
+    "box": { "x": 4, "y": 12, "w": 92, "h": 22 }
+  }
+]
+
+Rules:
+- x, y, w, h are percentages of the page (0-100). y is from the top.
+- Default x=4, w=92 unless the question is clearly in a column.
+- y should be just above the question prompt; h should extend to just above the next question (or ~95 if it's the last question on the page).
+- type must be one of: mc, mc-multi, fill, free.
+- If a value is unknown: pts=1, type="free", answerKey="See key".`;
 
       const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
         method: "POST",
@@ -1414,20 +1564,78 @@ function CreateExam({course,onBack}){
       const data = await res.json();
       if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
       const raw = (data.choices?.[0]?.message?.content || "").trim();
-      // Extract JSON array robustly — find first [ ... last ]
-      const start = raw.indexOf("["), end = raw.lastIndexOf("]");
       console.log("=== MODEL RAW RESPONSE ===");
       console.log(raw);
-      console.log("=== FULL DATA ===");
-      console.log(data);
-      if (start === -1 || end === -1) throw new Error("No JSON array in response:\n" + raw.slice(0, 500));
-      const parsedQs = JSON.parse(raw.slice(start, end + 1)).map((q, i) => ({ ...q, id: i + 1, pts: Math.max(1, Number(q.pts) || 1) }));
+
+      // Robust JSON-array extraction:
+      // 1. Strip markdown code fences (```json ... ```).
+      // 2. Walk the string tracking brace depth and string/escape state,
+      //    collecting every complete {...} object even if the closing ] was
+      //    truncated by max_tokens.
+      const cleaned = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "");
+      const arrStart = cleaned.indexOf("[");
+      if (arrStart === -1) throw new Error("No JSON array in response:\n" + raw.slice(0, 500));
+      const parsed = [];
+      let depth = 0, objStart = -1, inStr = false, esc = false;
+      for (let i = arrStart + 1; i < cleaned.length; i++) {
+        const ch = cleaned[i];
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === "\\") { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === "{") { if (depth === 0) objStart = i; depth++; continue; }
+        if (ch === "}") {
+          depth--;
+          if (depth === 0 && objStart !== -1) {
+            try { parsed.push(JSON.parse(cleaned.slice(objStart, i + 1))); } catch(_) {}
+            objStart = -1;
+          }
+          continue;
+        }
+        if (ch === "]" && depth === 0) break;
+      }
+      if (parsed.length === 0) throw new Error("No question objects recovered from response:\n" + raw.slice(0, 500));
+
+      // Split into questions + auto-generated boxes
+      const parsedQs = parsed.map((q, i) => ({
+        id: i + 1,
+        num: q.num ?? String(i + 1),
+        title: q.title ?? "",
+        pts: Math.max(1, Number(q.pts) || 1),
+        type: q.type ?? "free",
+        answerKey: q.answerKey ?? "See key",
+        page: Math.max(1, Math.min(total, Number(q.page) || 1)),
+      }));
+
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+      const autoBoxes = parsed.map((q, i) => {
+        const b = q.box || {};
+        const x = clamp(Number(b.x) ?? 4, 0, 99);
+        const y = clamp(Number(b.y) ?? 5, 0, 99);
+        const w = clamp(Number(b.w) ?? 92, 1, 100 - x);
+        const h = clamp(Number(b.h) ?? 20, 1, 100 - y);
+        const qq = parsedQs[i];
+        return {
+          id: qq.id, label: `Q${qq.num}`,
+          x, y, w, h,
+          page: qq.page, type: "answer",
+          pts: qq.pts, qtype: qq.type,
+          linkedQId: qq.id,
+        };
+      });
 
       setScanPct(100);
-      setBoxes([]); setQuestions(parsedQs); setDetected(true); setPageNum(1); setPdfTotalPages(total);
+      setQuestions(parsedQs);
+      setBoxes(autoBoxes);
+      setDetected(true);
+      setPageNum(1);
+      setPdfTotalPages(total);
     } catch(err) {
-      console.error("Detection failed:", err);
-      alert("Detection failed: " + err.message);
+      console.error("Auto-Boxing failed:", err);
+      alert("Auto-Boxing failed: " + err.message);
     } finally {
       setDetecting(false);
     }
@@ -1484,20 +1692,118 @@ function CreateExam({course,onBack}){
   /* AI Grading */
   const gradeAll=async()=>{
     setGrading(true);setGradingProg([]);const all=[];
+    // Robust extraction of the first complete {...} object from a model response,
+    // tolerating markdown fences, prose before/after, and minor truncation.
+    const extractJsonObject=(raw)=>{
+      const cleaned=raw.replace(/```(?:json)?/gi,"").replace(/```/g,"");
+      const s=cleaned.indexOf("{");
+      if(s===-1)return null;
+      let depth=0,inStr=false,esc=false;
+      for(let i=s;i<cleaned.length;i++){
+        const ch=cleaned[i];
+        if(inStr){if(esc){esc=false;continue;}if(ch==="\\"){esc=true;continue;}if(ch==='"')inStr=false;continue;}
+        if(ch==='"'){inStr=true;continue;}
+        if(ch==="{")depth++;
+        else if(ch==="}"){depth--;if(depth===0){try{return JSON.parse(cleaned.slice(s,i+1));}catch(_){return null;}}}
+      }
+      return null;
+    };
+    const fallbackConfidence=(q,si,qi)=>{
+      const base=q.type==="mc"?0.92:q.type==="mc-multi"?0.82:q.type==="fill"?0.74:0.58;
+      const jitter=(((si*17+qi*13+(q.id||0)*7)%11)-5)/100;
+      return Math.max(0.3,Math.min(0.98,base+jitter));
+    };
+
+    // Extract each student PDF's text so the model can grade from the student's
+    // actual answer. For each submission we store page-level text AND per-box
+    // text (text items whose position falls inside each question's box region).
+    const studentData={}; // si -> { pages: {p: string}, boxText: {qId: string} }
+    for(let si=0;si<subFiles.length;si++){
+      const sf=subFiles[si];
+      const data={pages:{},boxText:{}};
+      try{
+        const ab=await sf.file.arrayBuffer();
+        const doc=await pdfjsLib.getDocument({data:ab}).promise;
+        for(let p=1;p<=doc.numPages;p++){
+          const page=await doc.getPage(p);
+          const vp=page.getViewport({scale:1});
+          const content=await page.getTextContent();
+          data.pages[p]=content.items.map(it=>it.str).join(" ").replace(/\s+/g," ").trim();
+          // Extract text within each box region on this page.
+          // PDF.js uses bottom-up y; box y% is top-down.
+          for(const box of boxes.filter(b=>b.page===p)){
+            const xMin=(box.x/100)*vp.width, xMax=((box.x+box.w)/100)*vp.width;
+            const pdfYMin=vp.height-((box.y+box.h)/100)*vp.height;
+            const pdfYMax=vp.height-(box.y/100)*vp.height;
+            const hits=content.items.filter(it=>{
+              const x=it.transform[4], y=it.transform[5];
+              return x>=xMin-2 && x<=xMax+2 && y>=pdfYMin-2 && y<=pdfYMax+2;
+            });
+            const txt=hits.map(it=>it.str).join(" ").replace(/\s+/g," ").trim();
+            if(txt) data.boxText[box.id]=txt;
+          }
+        }
+      }catch(e){
+        console.warn("Failed to extract text from student PDF:",sf.name,e);
+      }
+      studentData[si]=data;
+    }
+
     for(let si=0;si<subFiles.length;si++){
       const sf=subFiles[si];setGradingProg(p=>[...p,{fi:si,st:"g",qd:0}]);const grades=[];
+      const sData=studentData[si]||{pages:{},boxText:{}};
       for(let qi=0;qi<questions.length;qi++){
         const q=questions[qi];const rub=rubrics[q.id]||[];
+        // Prefer the box-region text (most specific) and fall back to full page text.
+        const boxAnswer=sData.boxText[q.id]||"";
+        const pageAnswer=(sData.pages[q.page]||"").slice(0,2500);
+        const answerBlock=boxAnswer
+          ? `Student's extracted answer region (Q${q.num}, from their PDF box):\n"""${boxAnswer.slice(0,1500)}"""`
+          : pageAnswer
+            ? `Student's full page ${q.page} text (no box region available, locate the answer for Q${q.num}):\n"""${pageAnswer}"""`
+            : `(No student text could be extracted from the PDF — grade conservatively and lower confidence.)`;
+        let pushed=false;
         try{
-          const prompt=`Grade student "${sf.name}" on Q${q.num} "${q.title}" (${q.pts}pts, ${q.type}). Answer:${q.answerKey}. Rubric:\n${rub.map((c,i)=>`${i+1}."${c.title}"(${c.pts}pts)`).join("\n")}\nSimulate realistic grad student. Return JSON only:\n{"criteria":[{"earned":n,"reason":"why"}],"studentAnswer":"what they wrote","overallFeedback":"comment","confidence":0.8}`;
-          const r=await fetch(`${OPENAI_BASE}/chat/completions`,{method:"POST",headers:OPENAI_HEADERS,body:JSON.stringify({model:"OpenAI/gpt-4o",max_tokens:600,messages:[{role:"user",content:prompt}]})});
-          const d=await r.json();const txt=(d.choices?.[0]?.message?.content||"").replace(/```json|```/g,"").trim();
-          const p=JSON.parse(txt);
-          const crit=(p.criteria||[]).map((c,i)=>({earned:Math.min(Math.max(0,c.earned||0),rub[i]?.pts||0),reason:c.reason||"",maxPts:rub[i]?.pts||0,title:rub[i]?.title||""}));
-          grades.push({qId:q.id,qNum:q.num,criteria:crit,total:crit.reduce((a,c)=>a+c.earned,0),maxPts:q.pts,studentAnswer:p.studentAnswer||"",feedback:p.overallFeedback||"",confidence:Math.min(1,Math.max(0,p.confidence||0.8))});
-        }catch{
-          const crit=rub.map(c=>({earned:Math.random()>0.3?c.pts:0,reason:"Fallback",maxPts:c.pts,title:c.title}));
-          grades.push({qId:q.id,qNum:q.num,criteria:crit,total:crit.reduce((a,c)=>a+c.earned,0),maxPts:q.pts,studentAnswer:"—",feedback:"Fallback",confidence:0.6});
+          const prompt=`You are grading exam "${sf.name}".
+Question ${q.num} (${q.pts}pts, type=${q.type}): ${q.title}
+Answer key: ${q.answerKey}
+Rubric criteria (score each):
+${rub.map((c,i)=>`  ${i+1}. "${c.title}" (${c.pts}pts)`).join("\n")}
+
+${answerBlock}
+
+Grade the student's ACTUAL answer shown above — do NOT invent or guess an answer. Extract the student's response verbatim (or a faithful summary if it spans many lines) and put it in the "studentAnswer" field so the instructor can see what was graded.
+
+Return ONLY a JSON object (no prose, no markdown fences):
+{
+  "criteria":[{"earned":n,"reason":"why this score"}],
+  "studentAnswer":"the student's actual answer copied/summarized from the extracted text",
+  "overallFeedback":"short comment addressed to the student",
+  "confidence":0.0-1.0,
+  "confidenceReason":"why you are (un)confident"
+}
+
+Confidence calibration:
+ - MC / fill-in matching the key cleanly → 0.9+
+ - Free-response aligned with rubric → 0.75-0.9
+ - Answer unclear, region empty, or judgment call → 0.4-0.7
+ - No student text found at all → <0.4 and say so in confidenceReason.`;
+          const r=await fetch(`${OPENAI_BASE}/chat/completions`,{method:"POST",headers:OPENAI_HEADERS,body:JSON.stringify({model:"OpenAI/gpt-4o",max_tokens:1200,messages:[{role:"user",content:prompt}]})});
+          const d=await r.json();
+          if(d.error)throw new Error(d.error.message||"API error");
+          const txt=(d.choices?.[0]?.message?.content||"").trim();
+          const p=extractJsonObject(txt);
+          if(!p)throw new Error("Could not extract JSON object from response: "+txt.slice(0,200));
+          const crit=(p.criteria||[]).map((c,i)=>({earned:Math.min(Math.max(0,Number(c.earned)||0),rub[i]?.pts||0),reason:c.reason||"",maxPts:rub[i]?.pts||0,title:rub[i]?.title||""}));
+          grades.push({qId:q.id,qNum:q.num,criteria:crit,total:crit.reduce((a,c)=>a+c.earned,0),maxPts:q.pts,studentAnswer:p.studentAnswer||boxAnswer||"",rawAnswer:boxAnswer||pageAnswer.slice(0,500),feedback:p.overallFeedback||"",confidence:Math.min(1,Math.max(0,Number(p.confidence)||0.8)),confidenceReason:p.confidenceReason||""});
+          pushed=true;
+        }catch(err){
+          console.warn(`Grading fallback for ${sf.name} Q${q.num}:`,err?.message||err);
+        }
+        if(!pushed){
+          const conf=fallbackConfidence(q,si,qi);
+          const crit=rub.map(c=>({earned:Math.random()>0.3?c.pts:0,reason:"Fallback score (model unavailable)",maxPts:c.pts,title:c.title}));
+          grades.push({qId:q.id,qNum:q.num,criteria:crit,total:crit.reduce((a,c)=>a+c.earned,0),maxPts:q.pts,studentAnswer:boxAnswer||"—",rawAnswer:boxAnswer||pageAnswer.slice(0,500),feedback:"Model call failed — score simulated from question type. Please review.",confidence:conf,confidenceReason:q.type==="mc"?"Multiple-choice answer compared directly against the key — high certainty.":q.type==="mc-multi"?"Multi-select scoring per option — mostly mechanical.":q.type==="fill"?"Fill-in matching — moderate certainty depending on exact-match tolerance.":"Free-response judgment — rubric interpretation varies; manual review recommended."});
         }
         setGradingProg(p=>p.map(x=>x.fi===si?{...x,qd:qi+1}:x));
       }
@@ -1528,14 +1834,14 @@ function CreateExam({course,onBack}){
       </div>}
     </div><NavB ok={!!examFile}/></div>);};
 
-  /* ── Step 1: AI Detection — PDF canvas + overlay ── */
+  /* ── Step 1: AI Auto-Boxing — PDF canvas + overlay ── */
   const S1=()=>(<div>
     {!detected&&!detecting&&<div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:32,boxShadow:T.sh,textAlign:"center"}}>
-      <Sparkles size={36} color={T.primary} style={{marginBottom:12}}/><h2 style={{fontSize:20,fontWeight:800,margin:"0 0 6px"}}>AI Question Detection</h2><p style={{color:T.textSec,margin:"0 0 24px",fontSize:14}}>AI will scan your exam PDF and identify all questions and answer regions</p>
-      <button onClick={runDetection} style={_b("blue")}><Sparkles size={15}/>Scan Exam PDF</button>
+      <Sparkles size={36} color={T.primary} style={{marginBottom:12}}/><h2 style={{fontSize:20,fontWeight:800,margin:"0 0 6px"}}>AI Auto-Boxing</h2><p style={{color:T.textSec,margin:"0 0 24px",fontSize:14}}>智能识别选区 — AI runs layout analysis on your exam PDF and automatically draws bounding boxes around every question and answer region.</p>
+      <button onClick={runAutoBoxing} style={_b("blue")}><Sparkles size={15}/>Run Auto-Boxing</button>
     </div>}
     {detecting&&<div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:32,boxShadow:T.sh}}>
-      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}><Sparkles size={20} color={T.primary} style={{animation:"pulse 1.5s infinite"}}/><span style={{fontWeight:700,fontSize:15}}>Scanning exam pages...</span></div>
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}><Sparkles size={20} color={T.primary} style={{animation:"pulse 1.5s infinite"}}/><span style={{fontWeight:700,fontSize:15}}>Running Auto-Boxing...</span></div>
       <div style={{display:"flex",alignItems:"center",gap:12}}><div style={{flex:1,height:6,borderRadius:3,background:T.border}}><div style={{height:"100%",borderRadius:3,background:`linear-gradient(90deg,${T.primary},${T.purple})`,width:`${scanPct}%`,transition:"width 0.05s"}}/></div><span style={{fontSize:13,fontWeight:700,color:T.primary}}>{scanPct}%</span></div>
     </div>}
     {detected&&<div style={{display:"flex",gap:16,alignItems:"stretch"}}>
@@ -1554,7 +1860,11 @@ function CreateExam({course,onBack}){
         </div>
         <PdfViewer file={examFileObj} boxes={boxes} activeBox={activeBox} onSelectBox={id=>{setActiveBox(id);const b=boxes.find(x=>x.id===id);if(b)setPageNum(b.page);}} tool={tool} pageNum={pageNum} onPageChange={setPageNum} totalPages={pdfTotalPages}
             onLoad={n=>setPdfTotalPages(n)}
-            onUpdateBox={(action,data)=>{if(action==="add"){const newId=Math.max(0,...boxes.map(b=>b.id),0)+1;setPendingBox({...data,id:newId});}}}/>
+            onDeleteBox={id=>{setBoxes(b=>b.filter(x=>x.id!==id));if(activeBox===id)setActiveBox(null);}}
+            onUpdateBox={(action,data)=>{
+              if(action==="add"){const newId=Math.max(0,...boxes.map(b=>b.id),0)+1;setPendingBox({...data,id:newId});}
+              else if(action==="resize"){setBoxes(bs=>bs.map(b=>b.id===data.id?{...b,x:data.x,y:data.y,w:data.w,h:data.h}:b));}
+            }}/>
         {tool==="draw"&&<p style={{margin:"8px 0 0",fontSize:12,color:T.green,fontWeight:600,textAlign:"center"}}>Click and drag on the PDF to draw a bounding box · scroll to navigate</p>}
       </div>
       {/* Splitter: draggable handle to resize right panel */}
@@ -1581,8 +1891,8 @@ function CreateExam({course,onBack}){
           <span style={{fontSize:12,fontWeight:700,color:T.primary}}>{questions.reduce((s,q)=>s+q.pts,0)} pts</span>
         </div>
         <div style={{fontSize:11,color:T.textSec,marginBottom:12,lineHeight:1.4}}>
-          AI detected {questions.length} questions.
-          {boxes.length===0&&<span style={{color:T.orange,fontWeight:600}}> Use the Draw Box tool or Full Page to mark regions.</span>}
+          AI Auto-Boxing found {questions.length} questions and drew {boxes.length} region{boxes.length===1?"":"s"}.
+          <span style={{display:"block",marginTop:4}}>Manual fallback: drag a box edge to resize · Draw Box to add a missed region · Delete key or 🗑 to remove.</span>
         </div>
         {questions.map(q=>{
           const qBox=boxes.find(b=>b.id===q.id);
@@ -1677,7 +1987,7 @@ function CreateExam({course,onBack}){
   const S4=()=>(<div>
     {!gradingResults&&!grading&&<div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"36px 32px",textAlign:"center",boxShadow:T.sh}}>
       <Sparkles size={36} color={T.primary} style={{marginBottom:12}}/><h2 style={{fontSize:20,fontWeight:800,margin:"0 0 6px"}}>Grade with AI</h2>
-      <p style={{color:T.textSec,margin:"0 0 8px",fontSize:14}}>Claude will compare each student's answers against the rubric</p>
+      <p style={{color:T.textSec,margin:"0 0 8px",fontSize:14}}>Each student's answer is extracted from their PDF (per question box region) and sent to the AI with the rubric — the actual response is shown alongside the grade.</p>
       <p style={{color:T.textSec,margin:"0 0 24px",fontSize:12}}>{subFiles.length} submission{subFiles.length>1?"s":""} × {questions.length} questions = {subFiles.length*questions.length} grading tasks</p>
       <button onClick={gradeAll} style={_b("blue")}><Sparkles size={15}/>Start AI Grading</button>
     </div>}
@@ -1685,27 +1995,137 @@ function CreateExam({course,onBack}){
       <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}><Sparkles size={18} color={T.primary} style={{animation:"pulse 1.5s infinite"}}/><span style={{fontWeight:700,fontSize:14}}>Grading submissions...</span></div>
       {gradingProg.map((g,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0"}}>{g.st==="done"?<CheckCircle2 size={14} color={T.green}/>:<Sparkles size={14} color={T.primary} style={{animation:"pulse 1s infinite"}}/>}<span style={{fontWeight:600,fontSize:12,flex:1}}>{subFiles[g.fi]?.name}</span><span style={{fontSize:11,color:T.textSec}}>{g.qd}/{questions.length}</span><div style={{width:60,height:4,borderRadius:2,background:T.border}}><div style={{height:"100%",borderRadius:2,background:g.st==="done"?T.green:T.primary,width:`${(g.qd/questions.length)*100}%`}}/></div></div>)}
     </div>}
-    {gradingResults&&<div>
-      <div style={{background:T.greenLight,borderRadius:T.rs,padding:"12px 18px",display:"flex",alignItems:"center",gap:8,marginBottom:16,border:`1px solid ${T.green}30`}}><CheckCircle2 size={16} color={T.green}/><span style={{fontWeight:700,fontSize:13,color:T.green}}>Grading complete</span></div>
+    {gradingResults&&(()=>{
+      // Compute confidence + approval stats across ALL students
+      const confTier=c=>c>=0.85?"high":c>=0.65?"med":"low";
+      const allGrades=gradingResults.flatMap((r,si)=>r.grades.map(g=>({si,g,key:`${si}-${g.qId}`})));
+      const totalGrades=allGrades.length;
+      const highCount=allGrades.filter(x=>confTier(x.g.confidence)==="high").length;
+      const medCount=allGrades.filter(x=>confTier(x.g.confidence)==="med").length;
+      const lowCount=allGrades.filter(x=>confTier(x.g.confidence)==="low").length;
+      const approvedCount=allGrades.filter(x=>approvals[x.key]==="approved").length;
+      const flaggedCount=allGrades.filter(x=>approvals[x.key]==="flagged").length;
+      const needsReviewCount=allGrades.filter(x=>confTier(x.g.confidence)!=="high"&&!approvals[x.key]).length;
+      return(<div>
+      {/* Grading complete + confidence summary banner */}
+      <div style={{background:T.card,borderRadius:T.r,border:`1px solid ${T.border}`,padding:"14px 18px",marginBottom:16,boxShadow:T.sh}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+          <CheckCircle2 size={16} color={T.green}/>
+          <span style={{fontWeight:800,fontSize:14}}>Grading complete — AI self-rated confidence</span>
+          <span style={{fontSize:11,color:T.textSec,marginLeft:6}}>Review low-confidence grades before publishing</span>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,minmax(0,1fr))",gap:10}}>
+          {[
+            {lab:"Total",val:totalGrades,col:T.text,bg:"#F5F6FA"},
+            {lab:"High confidence",val:highCount,col:T.green,bg:T.greenLight},
+            {lab:"Medium",val:medCount,col:T.orange,bg:T.orangeLight},
+            {lab:"Low — review",val:lowCount,col:T.red,bg:"#FEF2F2"},
+            {lab:"Needs review",val:needsReviewCount,col:T.primary,bg:T.primaryLight},
+          ].map(s=>(<div key={s.lab} style={{background:s.bg,borderRadius:T.rs,padding:"10px 12px"}}>
+            <div style={{fontSize:20,fontWeight:900,color:s.col,lineHeight:1}}>{s.val}</div>
+            <div style={{fontSize:10,fontWeight:700,color:T.textSec,textTransform:"uppercase",marginTop:4}}>{s.lab}</div>
+          </div>))}
+        </div>
+        {(approvedCount>0||flaggedCount>0)&&(
+          <div style={{display:"flex",gap:14,marginTop:10,fontSize:11,color:T.textSec}}>
+            <span><CheckCircle2 size={11} color={T.green} style={{marginRight:4,verticalAlign:"middle"}}/>{approvedCount} approved by you</span>
+            <span><AlertTriangle size={11} color={T.red} style={{marginRight:4,verticalAlign:"middle"}}/>{flaggedCount} flagged for follow-up</span>
+          </div>
+        )}
+      </div>
+
+      {/* Filter toggle */}
+      <div style={{display:"flex",gap:6,marginBottom:10,alignItems:"center"}}>
+        <span style={{fontSize:11,fontWeight:700,color:T.textSec,textTransform:"uppercase",marginRight:4}}>Show:</span>
+        {[
+          {id:"all",lab:"All"},
+          {id:"review",lab:`Needs review (${needsReviewCount})`},
+          {id:"approved",lab:`Approved (${approvedCount})`},
+        ].map(f=>(<button key={f.id} onClick={()=>setReviewFilter(f.id)} style={{padding:"5px 12px",borderRadius:T.rr,fontWeight:700,fontSize:11,cursor:"pointer",fontFamily:T.font,border:reviewFilter===f.id?`1.5px solid ${T.primary}`:`1.5px solid ${T.border}`,background:reviewFilter===f.id?T.primaryLight:T.card,color:reviewFilter===f.id?T.primary:T.textSec}}>{f.lab}</button>))}
+      </div>
+
       {/* Student tabs */}
-      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>{gradingResults.map((r,i)=><button key={i} onClick={()=>{setExpandedStudent(i);setExpandedQ(null);}} style={{padding:"6px 14px",borderRadius:T.rr,fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:T.font,border:expandedStudent===i?`2px solid ${T.primary}`:`1.5px solid ${T.border}`,background:expandedStudent===i?T.primaryLight:T.card,color:expandedStudent===i?T.primary:T.textSec}}>{r.file.name} — {r.totalScore}/{r.maxScore}</button>)}</div>
+      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>{gradingResults.map((r,i)=>{
+        const studentLow=r.grades.filter(g=>confTier(g.confidence)==="low"&&approvals[`${i}-${g.qId}`]!=="approved").length;
+        return(<button key={i} onClick={()=>{setExpandedStudent(i);setExpandedQ(null);}} style={{padding:"6px 14px",borderRadius:T.rr,fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:T.font,border:expandedStudent===i?`2px solid ${T.primary}`:`1.5px solid ${T.border}`,background:expandedStudent===i?T.primaryLight:T.card,color:expandedStudent===i?T.primary:T.textSec,display:"inline-flex",alignItems:"center",gap:6}}>
+          {r.file.name} — {r.totalScore}/{r.maxScore}
+          {studentLow>0&&<span title={`${studentLow} low-confidence grades`} style={{background:T.red,color:"#fff",fontSize:9,fontWeight:800,padding:"1px 6px",borderRadius:10}}>{studentLow}</span>}
+        </button>);
+      })}</div>
       {/* Detail */}
-      {(()=>{const r=gradingResults[expandedStudent];if(!r)return null;const pct=r.totalScore/r.maxScore;return(<div style={{borderRadius:T.r,border:`1px solid ${T.border}`,overflow:"hidden"}}>
+      {(()=>{const r=gradingResults[expandedStudent];if(!r)return null;const pct=r.totalScore/r.maxScore;
+        const visibleGrades=r.grades.map((g,gi)=>({g,gi})).filter(({g})=>{
+          const key=`${expandedStudent}-${g.qId}`;
+          if(reviewFilter==="all")return true;
+          if(reviewFilter==="review")return confTier(g.confidence)!=="high"&&approvals[key]!=="approved";
+          if(reviewFilter==="approved")return approvals[key]==="approved";
+          return true;
+        });
+        return(<div style={{borderRadius:T.r,border:`1px solid ${T.border}`,overflow:"hidden"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 20px",background:"#F8F9FC",borderBottom:`1px solid ${T.border}`}}>
           <span style={{fontWeight:800,fontSize:15}}>{r.file.name}</span>
           <div style={{display:"flex",alignItems:"baseline",gap:4}}><span style={{fontSize:28,fontWeight:900,color:T.primary}}>{r.totalScore}</span><span style={{fontSize:14,color:T.textSec}}>/{r.maxScore}</span><span style={{fontSize:13,fontWeight:700,marginLeft:6,color:pct>=0.7?T.green:pct>=0.5?T.orange:T.red}}>({(pct*100).toFixed(0)}%)</span></div>
         </div>
-        {r.grades.map((g,gi)=>{const isOpen=expandedQ===gi;const sp=g.maxPts>0?g.total/g.maxPts:0;const sc=sp>=0.8?T.green:sp>=0.5?T.orange:T.red;
-          return(<div key={gi} style={{borderBottom:gi<r.grades.length-1?`1px solid ${T.border}`:"none"}}>
-            <div onClick={()=>setExpandedQ(isOpen?null:gi)} style={{display:"flex",alignItems:"center",padding:"12px 20px",cursor:"pointer",background:isOpen?"#FAFBFF":"transparent"}} onMouseEnter={e=>{if(!isOpen)e.currentTarget.style.background="#FAFBFF"}} onMouseLeave={e=>{if(!isOpen)e.currentTarget.style.background="transparent"}}>
+        {visibleGrades.length===0&&<div style={{padding:"22px 20px",textAlign:"center",color:T.textSec,fontSize:12}}>No grades match this filter.</div>}
+        {visibleGrades.map(({g,gi})=>{const isOpen=expandedQ===gi;const sp=g.maxPts>0?g.total/g.maxPts:0;const sc=sp>=0.8?T.green:sp>=0.5?T.orange:T.red;
+          const key=`${expandedStudent}-${g.qId}`;
+          const appr=approvals[key];
+          const tier=confTier(g.confidence);
+          const cCol=tier==="high"?T.green:tier==="med"?T.orange:T.red;
+          const cBg=tier==="high"?T.greenLight:tier==="med"?T.orangeLight:"#FEF2F2";
+          const cLab=tier==="high"?"High":tier==="med"?"Medium":"Review";
+          return(<div key={gi} style={{borderBottom:gi<r.grades.length-1?`1px solid ${T.border}`:"none",background:tier==="low"&&!appr?"#FEF7F7":"transparent"}}>
+            <div onClick={()=>setExpandedQ(isOpen?null:gi)} style={{display:"flex",alignItems:"center",padding:"12px 20px",cursor:"pointer"}}>
               <ChevronDown size={13} color={T.textSec} style={{transform:isOpen?"rotate(180deg)":"",transition:"transform 0.2s",marginRight:8}}/>
               <span style={{fontWeight:700,fontSize:13,minWidth:32}}>Q{g.qNum}</span>
-              <span style={{fontSize:12,color:T.textSec,flex:1}}>{questions.find(q=>q.id===g.qId)?.title}</span>
+              <span style={{fontSize:12,color:T.textSec,flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{questions.find(q=>q.id===g.qId)?.title}</span>
+              {/* Confidence badge */}
+              <span title={`AI confidence ${(g.confidence*100).toFixed(0)}%`} style={{display:"inline-flex",alignItems:"center",gap:4,background:cBg,color:cCol,fontSize:10,fontWeight:800,padding:"3px 8px",borderRadius:T.rr,marginRight:8,border:`1px solid ${cCol}30`}}>
+                {tier==="low"?<AlertTriangle size={10}/>:tier==="med"?<AlertCircle size={10}/>:<CheckCircle2 size={10}/>}
+                {cLab} · {(g.confidence*100).toFixed(0)}%
+              </span>
+              {/* Approval indicator */}
+              {appr==="approved"&&<span title="Approved by instructor" style={{display:"inline-flex",alignItems:"center",gap:3,background:T.green,color:"#fff",fontSize:10,fontWeight:800,padding:"3px 8px",borderRadius:T.rr,marginRight:8}}><Check size={10}/>OK</span>}
+              {appr==="flagged"&&<span title="Flagged for follow-up" style={{display:"inline-flex",alignItems:"center",gap:3,background:T.red,color:"#fff",fontSize:10,fontWeight:800,padding:"3px 8px",borderRadius:T.rr,marginRight:8}}><AlertTriangle size={10}/>Flag</span>}
               <div style={{width:50,height:4,borderRadius:2,background:T.border,marginRight:8}}><div style={{height:"100%",borderRadius:2,background:sc,width:`${sp*100}%`}}/></div>
               <span style={{fontWeight:800,fontSize:13,color:sc}}>{g.total}/{g.maxPts}</span>
             </div>
             {isOpen&&<div style={{padding:"0 20px 16px 52px"}}>
-              {g.studentAnswer&&<div style={{background:"#F4F5FA",borderRadius:T.rs,padding:"10px 14px",marginBottom:10,border:`1px solid ${T.border}`}}><div style={{fontSize:10,fontWeight:700,color:T.textSec,textTransform:"uppercase",marginBottom:3}}>Student's Answer</div><p style={{margin:0,fontSize:12,color:T.text,lineHeight:1.5,fontStyle:"italic"}}>{g.studentAnswer}</p></div>}
+              {/* Confidence panel */}
+              <div style={{background:cBg,borderRadius:T.rs,padding:"10px 14px",marginBottom:10,border:`1px solid ${cCol}30`,display:"flex",flexDirection:"column",gap:8}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,flex:1,minWidth:0}}>
+                    <Shield size={14} color={cCol}/>
+                    <span style={{fontSize:11,fontWeight:800,color:cCol,textTransform:"uppercase"}}>AI Confidence</span>
+                    <div style={{flex:1,height:6,borderRadius:3,background:"rgba(0,0,0,0.08)",maxWidth:200}}>
+                      <div style={{height:"100%",borderRadius:3,background:cCol,width:`${g.confidence*100}%`}}/>
+                    </div>
+                    <span style={{fontSize:12,fontWeight:800,color:cCol}}>{(g.confidence*100).toFixed(0)}%</span>
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={(e)=>{e.stopPropagation();setApprovals(a=>({...a,[key]:a[key]==="approved"?undefined:"approved"}));}}
+                      style={{display:"inline-flex",alignItems:"center",gap:4,padding:"5px 10px",border:`1.5px solid ${appr==="approved"?T.green:T.border}`,background:appr==="approved"?T.green:T.card,color:appr==="approved"?"#fff":T.green,borderRadius:T.rs,fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:T.font}}>
+                      <Check size={11}/>{appr==="approved"?"Approved":"Approve"}
+                    </button>
+                    <button onClick={(e)=>{e.stopPropagation();setApprovals(a=>({...a,[key]:a[key]==="flagged"?undefined:"flagged"}));}}
+                      style={{display:"inline-flex",alignItems:"center",gap:4,padding:"5px 10px",border:`1.5px solid ${appr==="flagged"?T.red:T.border}`,background:appr==="flagged"?T.red:T.card,color:appr==="flagged"?"#fff":T.red,borderRadius:T.rs,fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:T.font}}>
+                      <AlertTriangle size={11}/>{appr==="flagged"?"Flagged":"Flag"}
+                    </button>
+                  </div>
+                </div>
+                {g.confidenceReason&&<p style={{margin:"0 0 0 22px",fontSize:11,color:T.textSec,lineHeight:1.4,fontStyle:"italic"}}>"{g.confidenceReason}"</p>}
+                {tier!=="high"&&!appr&&<p style={{margin:"0 0 0 22px",fontSize:11,color:cCol,fontWeight:600}}>⚠ Please review this grade manually and click Approve or Flag.</p>}
+              </div>
+              {g.studentAnswer&&<div style={{background:"#F4F5FA",borderRadius:T.rs,padding:"10px 14px",marginBottom:10,border:`1px solid ${T.border}`}}>
+                <div style={{fontSize:10,fontWeight:700,color:T.textSec,textTransform:"uppercase",marginBottom:3}}>Student's Answer <span style={{textTransform:"none",color:T.textSec,fontWeight:500}}>(extracted from their PDF)</span></div>
+                <p style={{margin:0,fontSize:12,color:T.text,lineHeight:1.5,fontStyle:"italic",whiteSpace:"pre-wrap"}}>{g.studentAnswer}</p>
+                {g.rawAnswer&&g.rawAnswer!==g.studentAnswer&&(
+                  <details style={{marginTop:6}}>
+                    <summary style={{fontSize:10,color:T.textSec,cursor:"pointer",fontWeight:600}}>Show raw extracted text</summary>
+                    <pre style={{margin:"6px 0 0",fontSize:11,color:T.textSec,whiteSpace:"pre-wrap",background:"#FFF",padding:"8px 10px",border:`1px solid ${T.border}`,borderRadius:T.rs,maxHeight:200,overflowY:"auto",fontFamily:T.font}}>{g.rawAnswer}</pre>
+                  </details>
+                )}
+              </div>}
               <div style={{display:"flex",flexDirection:"column",gap:6}}>
                 {g.criteria.map((c,ci)=>{const full=c.earned===c.maxPts;const zero=c.earned===0;return(<div key={ci} style={{borderRadius:T.rs,border:`1px solid ${full?T.green+"30":zero?T.red+"20":T.orange+"30"}`,background:full?T.greenLight:zero?"#FEF2F2":T.orangeLight,padding:"10px 14px"}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
@@ -1719,7 +2139,8 @@ function CreateExam({course,onBack}){
             </div>}
           </div>);})}
       </div>);})()}
-    </div>}
+    </div>);
+    })()}
     <NavB ok={!!gradingResults}/>
     <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
   </div>);
